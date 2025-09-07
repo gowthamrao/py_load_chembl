@@ -3,6 +3,7 @@ from pathlib import Path
 from py_load_chembl import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
+from py_load_chembl import schema_parser
 
 
 class LoaderPipeline:
@@ -116,74 +117,87 @@ class LoaderPipeline:
         self.adapter.optimize_post_load(schema="public") # Schema is illustrative
 
     def _execute_delta_load(self):
-        """Handles the delta data load stage."""
+        """
+        Handles the delta data load stage by parsing the DDL, and then iterating
+        through each table to stage, merge, and clean up.
+        """
         if not self.adapter or not self.pg_dump_path:
             raise RuntimeError("Adapter and data path must be configured for delta load.")
 
         print("\n--- Stage: Delta Load ---")
 
-        # For now, focus on one table: molecule_dictionary
-        table_name = "molecule_dictionary"
-        # Based on inspection of ChEMBL DDL
-        schema_info = {
-            "pk": ["molregno"],
-            "cols": ["molregno", "chembl_id", "pref_name", "molecule_type"],
-            "ddl": """(
-                molregno     integer NOT NULL,
-                chembl_id    varchar(20) NOT NULL,
-                pref_name    varchar(255),
-                molecule_type varchar(30)
-            )"""
-        }
-
+        # Define schema and paths
         staging_schema = "staging"
         target_schema = "public"
+        archive_base_dir = f"chembl_{self.chembl_version}_postgresql"
 
-        # The data file is inside the main archive, named e.g. chembl_33_postgresql/chembl_33.txt/molecule_dictionary.txt
-        # The test data is simpler, but we code for the real structure.
-        # Note: ChEMBL dumps often have a .txt extension for data files.
-        archive_internal_path = f"chembl_{self.chembl_version}_postgresql/chembl_{self.chembl_version}.txt/{table_name}.txt"
+        # It's common for DDL files to have a naming convention.
+        ddl_file_path_in_archive = f"{archive_base_dir}/chembl_{self.chembl_version}_ddl.sql"
 
-        try:
-            # 1. Extract the specific data file we need
-            data_file = self._extract_file_from_archive(self.pg_dump_path, archive_internal_path)
+        # Data files are usually in a subdirectory. Let's check a few common names.
+        data_dir_in_archive = f"{archive_base_dir}/chembl_{self.chembl_version}_data"
 
-            # 2. Create staging table
-            print(f"Creating staging table for {table_name}...")
-            self.adapter.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {staging_schema};")
-            self.adapter.execute_ddl(f"CREATE UNLOGGED TABLE {staging_schema}.{table_name} {schema_info['ddl']};")
+        # 1. Extract and parse the DDL file to get all table schemas in order
+        print(f"Extracting DDL file: {ddl_file_path_in_archive}")
+        ddl_file = self._extract_file_from_archive(self.pg_dump_path, ddl_file_path_in_archive)
+        ddl_content = ddl_file.read_text()
 
-            # 3. Load data into staging
-            self.adapter.bulk_load_table(
-                table_name=table_name,
-                data_source=data_file,
-                schema=staging_schema
-            )
+        print("Parsing DDL and sorting tables by dependency...")
+        all_tables = schema_parser.parse_chembl_ddl(ddl_content)
+        print(f"Found {len(all_tables)} tables to process.")
 
-            # 4. Merge data
-            merge_stats = self.adapter.execute_merge(
-                source_table=f"{staging_schema}.{table_name}",
-                target_table=f"{target_schema}.{table_name}",
-                primary_keys=schema_info["pk"],
-                all_columns=schema_info["cols"]
-            )
+        # 2. Create staging schema
+        self.adapter.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {staging_schema};")
 
-            # 5. Log results
-            # A real implementation would get stage_record_count first.
-            self._log_load_details(
-                table_name=table_name,
-                stage_record_count=0, # Placeholder
-                insert_count=merge_stats["inserted"],
-                update_count=merge_stats["updated"]
-            )
+        # 3. Loop through each table and process it
+        for table in all_tables:
+            print(f"\n--- Processing table: {table.name} ---")
+            data_file = None
+            try:
+                # a. Extract the table's data file
+                data_file_path_in_archive = f"{data_dir_in_archive}/{table.name}.tsv"
+                data_file = self._extract_file_from_archive(self.pg_dump_path, data_file_path_in_archive)
 
-        finally:
-            # 6. Cleanup
-            print("Cleaning up staging tables...")
-            self.adapter.execute_sql(f"DROP TABLE IF EXISTS {staging_schema}.{table_name};")
-            # And remove the extracted file
-            if 'data_file' in locals() and data_file.exists():
-                data_file.unlink()
+                # b. Create staging table
+                print(f"Creating staging table: {staging_schema}.{table.name}")
+                column_defs = ", ".join(f'"{c.name}" {c.dtype}' for c in table.columns)
+                create_staging_sql = f'CREATE UNLOGGED TABLE {staging_schema}."{table.name}" ({column_defs});'
+                self.adapter.execute_ddl(create_staging_sql)
+
+                # c. Load data into staging
+                self.adapter.bulk_load_table(
+                    table_name=f'"{table.name}"', # Quote to handle reserved keywords
+                    data_source=data_file,
+                    schema=staging_schema
+                )
+
+                # d. Merge data
+                all_columns = [c.name for c in table.columns]
+                merge_stats = self.adapter.execute_merge(
+                    source_table=f'{staging_schema}."{table.name}"',
+                    target_table=f'{target_schema}."{table.name}"',
+                    primary_keys=table.primary_keys,
+                    all_columns=all_columns
+                )
+
+                # e. Log results
+                self._log_load_details(
+                    table_name=table.name,
+                    stage_record_count=0,  # Placeholder, could be implemented with a SELECT COUNT(*)
+                    insert_count=merge_stats.get("inserted", 0),
+                    update_count=merge_stats.get("updated", 0)
+                )
+
+            finally:
+                # f. Cleanup
+                print(f"Cleaning up staging table and data file for {table.name}...")
+                self.adapter.execute_sql(f'DROP TABLE IF EXISTS {staging_schema}."{table.name}";')
+                if data_file and data_file.exists():
+                    data_file.unlink()
+
+        # Cleanup the extracted DDL file
+        if ddl_file and ddl_file.exists():
+            ddl_file.unlink()
 
     def _extract_file_from_archive(self, archive_path: Path, file_to_extract: str) -> Path:
         """Extracts a single file from the .tar.gz archive to the output directory."""
