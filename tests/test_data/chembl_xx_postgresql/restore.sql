@@ -1,0 +1,2 @@
+-- This file is intentionally left blank for the test.
+-- The custom format for pg_restore relies on toc.dat and the data files.
