@@ -28,29 +28,136 @@ class PostgresAdapter(DatabaseAdapter):
                 raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
         return self.conn
 
+    def execute_sql(self, sql: str, params: tuple = None, fetch: str | None = None) -> Any:
+        """Executes an arbitrary SQL command."""
+        conn = self.connect()
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, params)
+                if fetch == 'one':
+                    return cursor.fetchone()
+                if fetch == 'all':
+                    return cursor.fetchall()
+                conn.commit()
+        except psycopg2.Error as e:
+            conn.rollback()
+            raise RuntimeError(f"Database query failed: {e}") from e
+
+    def create_metadata_tables(self) -> None:
+        """Creates the metadata tracking tables if they don't exist."""
+        print("Ensuring metadata tables exist...")
+        meta_schema = "chembl_loader_meta"
+        schema_ddl = f"CREATE SCHEMA IF NOT EXISTS {meta_schema};"
+
+        history_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {meta_schema}.load_history (
+            load_id SERIAL PRIMARY KEY,
+            chembl_version VARCHAR(10) NOT NULL,
+            load_type VARCHAR(10) NOT NULL,
+            start_timestamp TIMESTAMPTZ NOT NULL,
+            end_timestamp TIMESTAMPTZ,
+            status VARCHAR(10) NOT NULL,
+            loader_version VARCHAR(20),
+            error_message TEXT
+        );
+        """
+
+        details_ddl = f"""
+        CREATE TABLE IF NOT EXISTS {meta_schema}.load_details (
+            detail_id SERIAL PRIMARY KEY,
+            load_id INTEGER NOT NULL REFERENCES {meta_schema}.load_history(load_id),
+            table_name VARCHAR(100) NOT NULL,
+            stage_record_count BIGINT,
+            insert_count BIGINT,
+            update_count BIGINT,
+            obsolete_count BIGINT
+        );
+        """
+        self.execute_sql(schema_ddl)
+        self.execute_sql(history_ddl)
+        self.execute_sql(details_ddl)
+        print("Metadata tables are ready.")
+
     def execute_ddl(self, ddl_script: str) -> None:
         """Executes a DDL script (e.g., schema creation, index management)."""
-        # This might be used for schema creation if not using pg_restore
-        pass
+        print(f"Executing DDL...")
+        self.execute_sql(ddl_script)
+        print("DDL execution complete.")
 
     def bulk_load_table(
         self, table_name: str, data_source: Path | str, schema: str = "public", options: Dict[str, Any] = {}
     ) -> None:
         """
-        Performs a high-performance native bulk load using pg_restore.
+        Performs high-performance native bulk loading.
+        - If data_source is a .tar.gz archive, uses pg_restore for a full restore.
+        - If data_source is a .tsv file, uses the COPY command for a single table.
+        """
+        data_source_path = Path(data_source)
+        if data_source_path.name.endswith(".tar.gz"):
+            print(f"Initiating full database restore from '{data_source_path}'...")
+            self._run_pg_restore(data_source_path)
+            print("Database restore completed.")
+        elif data_source_path.name.endswith(".tsv"):
+            print(f"Initiating COPY load into '{schema}.{table_name}' from '{data_source_path}'...")
+            conn = self.connect()
+            sql = f"COPY {schema}.{table_name} FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL 'None')"
+            try:
+                with conn.cursor() as cursor, open(data_source_path, 'r', encoding='utf-8') as f:
+                    # Using copy_expert to allow for dynamic table/schema names
+                    cursor.copy_expert(sql, f)
+                conn.commit()
+                print("COPY load completed.")
+            except psycopg2.Error as e:
+                conn.rollback()
+                raise RuntimeError(f"Failed to COPY data into {schema}.{table_name}: {e}") from e
+        else:
+            raise ValueError(f"Unsupported data source format: {data_source_path.name}")
 
-        Note: For a full database dump, table_name and schema are ignored
-        as pg_restore restores the entire database defined in the dump.
+    def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], all_columns: List[str]) -> Dict[str, int]:
         """
-        print(f"Initiating full database restore from '{data_source}'...")
-        self._run_pg_restore(Path(data_source))
-        print("Database restore completed.")
+        Executes an efficient MERGE/UPSERT operation from source (staging) to target (production)
+        using INSERT ... ON CONFLICT.
 
-    def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], columns: List[str]) -> None:
+        Returns a dictionary with 'inserted' and 'updated' counts.
         """
-        Executes an efficient MERGE/UPSERT operation from source (staging) to target (production).
+        print(f"Merging data from '{source_table}' into '{target_table}'...")
+        non_pk_columns = [col for col in all_columns if col not in primary_keys]
+
+        if not non_pk_columns:
+            raise ValueError("The `all_columns` list must contain columns other than the primary keys for updating.")
+
+        conflict_target = ", ".join(primary_keys)
+        update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in non_pk_columns)
+        column_list = ", ".join(all_columns)
+
+        # The 'xmax = 0' is a PostgreSQL system column trick.
+        # xmax is 0 for a newly inserted row. For an updated row, it's non-zero.
+        # This allows us to count how many rows were inserted vs. updated.
+        sql = f"""
+        WITH results AS (
+            INSERT INTO {target_table} ({column_list})
+            SELECT {column_list} FROM {source_table}
+            ON CONFLICT ({conflict_target}) DO UPDATE
+            SET {update_clause}
+            RETURNING xmax = 0 AS is_insert
+        )
+        SELECT
+            COUNT(*) AS total_rows,
+            SUM(CASE WHEN is_insert THEN 1 ELSE 0 END) AS inserted_count
+        FROM results;
         """
-        pass
+
+        result = self.execute_sql(sql, fetch='one')
+        total_rows, inserted_count = result[0], result[1]
+
+        # Handle case where no rows are processed
+        if total_rows is None:
+            total_rows, inserted_count = 0, 0
+
+        updated_count = total_rows - inserted_count
+
+        print(f"Merge complete. Inserted: {inserted_count}, Updated: {updated_count}")
+        return {"inserted": inserted_count, "updated": updated_count}
 
     def optimize_pre_load(self, schema: str) -> None:
         """Disables constraints and indexes before a full load."""

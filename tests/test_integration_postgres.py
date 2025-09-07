@@ -119,6 +119,97 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock):
         if conn:
             conn.close()
 
+
+def test_postgres_delta_load(postgres_service, tmp_path, requests_mock):
+    """
+    Tests the end-to-end DELTA load process for a single table.
+    """
+    # --- 1. Setup: Create initial state in the database ---
+    _create_database(postgres_service)
+    conn = psycopg2.connect(postgres_service["uri"])
+    with conn.cursor() as cursor:
+        # Create schema and table
+        cursor.execute("CREATE TABLE molecule_dictionary (molregno integer NOT NULL, chembl_id varchar(20) NOT NULL, pref_name varchar(255), molecule_type varchar(30));")
+        cursor.execute("ALTER TABLE molecule_dictionary ADD PRIMARY KEY (molregno);")
+        # Insert initial data: one record to be updated, one to be left alone
+        cursor.execute("INSERT INTO molecule_dictionary VALUES (1, 'CHEMBL1', 'OLD_NAME', 'Small Molecule');")
+        cursor.execute("INSERT INTO molecule_dictionary VALUES (99, 'CHEMBL99', 'UNCHANGED', 'Peptide');")
+    conn.commit()
+    conn.close()
+
+    # --- 2. Setup: Create test data file and archive for the delta ---
+    test_data_dir = tmp_path / "delta_data"
+    test_data_dir.mkdir()
+
+    # This file contains one record to UPDATE (molregno=1) and one to INSERT (molregno=3)
+    delta_file_content = "1\tCHEMBL1\tNEW_NAME\tSmall Molecule\n3\tCHEMBL3\tNEW_DRUG\tOligonucleotide\n"
+    delta_file = test_data_dir / "molecule_dictionary.txt"
+    delta_file.write_text(delta_file_content)
+
+    # Create a tar.gz archive that mimics the real ChEMBL structure
+    archive_path = tmp_path / "chembl_delta_test.tar.gz"
+    chembl_version = "100"
+    internal_dir = f"chembl_{chembl_version}_postgresql/chembl_{chembl_version}.txt/"
+
+    import tarfile
+    with tarfile.open(archive_path, "w:gz") as tar:
+        # We need to add a directory structure inside the tarball
+        tar_info = tarfile.TarInfo(name=internal_dir)
+        tar_info.type = tarfile.DIRTYPE
+        tar.addfile(tarinfo=tar_info)
+        tar.add(delta_file, arcname=f"{internal_dir}{delta_file.name}")
+
+    # --- 3. Mock all external HTTP requests ---
+    base_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}"
+    dump_url = f"{base_url}/chembl_{chembl_version}_postgresql.tar.gz"
+    checksum_url = f"{base_url}/checksums.txt"
+    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{chembl_version}/"></a>')
+    requests_mock.get(checksum_url, text=f"md5checksum  {archive_path.name}") # Dummy checksum
+    requests_mock.get(dump_url, content=archive_path.read_bytes())
+
+    # --- 4. Configure and run the pipeline in DELTA mode ---
+    output_dir = tmp_path / "chembl_data"
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+    pipeline = LoaderPipeline(
+        adapter=adapter,
+        version=chembl_version,
+        mode="DELTA",
+        output_dir=output_dir,
+    )
+    pipeline.run()
+
+    # --- 5. Assert the final state of the database ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    try:
+        with conn.cursor() as cursor:
+            # Check data integrity
+            cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
+            assert cursor.fetchone()[0] == 3 # 2 initial + 1 insert
+
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
+            assert cursor.fetchone()[0] == "NEW_NAME" # Updated
+
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 99;")
+            assert cursor.fetchone()[0] == "UNCHANGED" # Untouched
+
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 3;")
+            assert cursor.fetchone()[0] == "NEW_DRUG" # Inserted
+
+            # Check metadata
+            cursor.execute("SELECT load_type, status FROM chembl_loader_meta.load_history WHERE load_id = %s;", (pipeline.load_id,))
+            load_type, status = cursor.fetchone()
+            assert load_type == "DELTA"
+            assert status == "SUCCESS"
+
+            cursor.execute("SELECT table_name, insert_count, update_count FROM chembl_loader_meta.load_details WHERE load_id = %s;", (pipeline.load_id,))
+            table_name, insert_count, update_count = cursor.fetchone()
+            assert table_name == "molecule_dictionary"
+            assert insert_count == 1
+            assert update_count == 1
+    finally:
+        conn.close()
+
+
 def _create_database(pg_config):
     """Creates the test database if it doesn't exist."""
     # Connect to the default 'postgres' database to run the CREATE DATABASE command
