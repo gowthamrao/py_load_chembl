@@ -1,3 +1,4 @@
+import psycopg2
 from typing import Any, Dict, List
 from pathlib import Path
 
@@ -6,9 +7,18 @@ from py_load_chembl.adapters.base import DatabaseAdapter
 class PostgresAdapter(DatabaseAdapter):
     """Database adapter for PostgreSQL."""
 
+    def __init__(self, connection_string: str):
+        self.connection_string = connection_string
+        self.conn = None
+
     def connect(self) -> Any:
         """Establishes a connection to the target database."""
-        pass
+        if self.conn is None or self.conn.closed:
+            try:
+                self.conn = psycopg2.connect(self.connection_string)
+            except psycopg2.OperationalError as e:
+                raise ConnectionError(f"Failed to connect to PostgreSQL: {e}") from e
+        return self.conn
 
     def execute_ddl(self, ddl_script: str) -> None:
         """Executes a DDL script (e.g., schema creation, index management)."""
