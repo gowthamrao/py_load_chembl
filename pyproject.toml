@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "py-load-chembl"
+version = "0.1.0"
+description = "A Python package for loading the ChEMBL database into various relational database systems."
+authors = ["Gowtham Rao <rao@ohdsi.org>"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+psycopg2-binary = { version = "^2.9.9", optional = true }
+pytest = { version = "^7.4.0", optional = true }
+
+[tool.poetry.extras]
+postgres = ["psycopg2-binary"]
+test = ["pytest"]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
