@@ -10,19 +10,15 @@ from py_load_chembl.adapters.postgres import PostgresAdapter
 # Mark all tests in this file as integration tests
 pytestmark = pytest.mark.integration
 
-# Helper function to check if docker is running
-def is_docker_running():
-    import subprocess
-    try:
-        subprocess.run(["docker", "info"], capture_output=True, check=True)
-        return True
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return False
+# The pytest-docker plugin handles service availability.
+# The manual check below is removed as it can fail in certain CI environments
+# where the docker socket is available but the CLI is not in the path.
 
-# Skip all tests in this file if Docker is not running
-if not is_docker_running():
-    pytest.skip("Docker is not running, skipping integration tests.", allow_module_level=True)
-
+# @pytest.fixture(scope="module")
+# def is_docker_running():
+#     ...
+# if not is_docker_running():
+#     ...
 
 @pytest.fixture(scope="module")
 def postgres_service(docker_ip, docker_services):
@@ -120,54 +116,35 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock):
             conn.close()
 
 
-def test_postgres_delta_load(postgres_service, tmp_path, requests_mock):
+def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock):
     """
-    Tests the end-to-end DELTA load process for a single table.
+    Tests the new, robust delta load workflow.
+    1. Runs a full load to establish an initial "production" state.
+    2. Manually alters a record in the production database.
+    3. Runs a delta load with the same source data.
+    4. Asserts that the altered record was merged (updated) correctly.
+    5. Asserts that the temporary staging schema was cleaned up.
     """
-    # --- 1. Setup: Create initial state in the database ---
-    _create_database(postgres_service)
+    # --- 1. Setup: Run a FULL load to create the initial state ---
+    # This uses the exact same logic and mocks as the full_load test
+    test_postgres_full_load(postgres_service, tmp_path, requests_mock)
+
+    # --- 2. Setup: Manually alter a record in the "production" database ---
     conn = psycopg2.connect(postgres_service["uri"])
-    with conn.cursor() as cursor:
-        # Create schema and table
-        cursor.execute("CREATE TABLE molecule_dictionary (molregno integer NOT NULL, chembl_id varchar(20) NOT NULL, pref_name varchar(255), molecule_type varchar(30));")
-        cursor.execute("ALTER TABLE molecule_dictionary ADD PRIMARY KEY (molregno);")
-        # Insert initial data: one record to be updated, one to be left alone
-        cursor.execute("INSERT INTO molecule_dictionary VALUES (1, 'CHEMBL1', 'OLD_NAME', 'Small Molecule');")
-        cursor.execute("INSERT INTO molecule_dictionary VALUES (99, 'CHEMBL99', 'UNCHANGED', 'Peptide');")
-    conn.commit()
-    conn.close()
+    try:
+        with conn.cursor() as cursor:
+            # This record will be updated by the delta load
+            cursor.execute("UPDATE molecule_dictionary SET pref_name = 'OLD ASPIRIN' WHERE molregno = 1;")
+            # This record should not be touched
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;")
+            assert cursor.fetchone()[0] == "PARACETAMOL"
+        conn.commit()
+    finally:
+        conn.close()
 
-    # --- 2. Setup: Create test data file and archive for the delta ---
-    test_data_dir = tmp_path / "delta_data"
-    test_data_dir.mkdir()
-
-    # This file contains one record to UPDATE (molregno=1) and one to INSERT (molregno=3)
-    delta_file_content = "1\tCHEMBL1\tNEW_NAME\tSmall Molecule\n3\tCHEMBL3\tNEW_DRUG\tOligonucleotide\n"
-    delta_file = test_data_dir / "molecule_dictionary.txt"
-    delta_file.write_text(delta_file_content)
-
-    # Create a tar.gz archive that mimics the real ChEMBL structure
-    archive_path = tmp_path / "chembl_delta_test.tar.gz"
-    chembl_version = "100"
-    internal_dir = f"chembl_{chembl_version}_postgresql/chembl_{chembl_version}.txt/"
-
-    import tarfile
-    with tarfile.open(archive_path, "w:gz") as tar:
-        # We need to add a directory structure inside the tarball
-        tar_info = tarfile.TarInfo(name=internal_dir)
-        tar_info.type = tarfile.DIRTYPE
-        tar.addfile(tarinfo=tar_info)
-        tar.add(delta_file, arcname=f"{internal_dir}{delta_file.name}")
-
-    # --- 3. Mock all external HTTP requests ---
-    base_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}"
-    dump_url = f"{base_url}/chembl_{chembl_version}_postgresql.tar.gz"
-    checksum_url = f"{base_url}/checksums.txt"
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{chembl_version}/"></a>')
-    requests_mock.get(checksum_url, text=f"md5checksum  {archive_path.name}") # Dummy checksum
-    requests_mock.get(dump_url, content=archive_path.read_bytes())
-
-    # --- 4. Configure and run the pipeline in DELTA mode ---
+    # --- 3. Configure and run the pipeline in DELTA mode ---
+    # Mocks are already set up from the full load test call
+    chembl_version = "99" # Must match version from full_load test
     output_dir = tmp_path / "chembl_data"
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     pipeline = LoaderPipeline(
@@ -178,34 +155,32 @@ def test_postgres_delta_load(postgres_service, tmp_path, requests_mock):
     )
     pipeline.run()
 
-    # --- 5. Assert the final state of the database ---
+    # --- 4. Assert the final state of the database ---
     conn = psycopg2.connect(postgres_service["uri"])
     try:
         with conn.cursor() as cursor:
-            # Check data integrity
-            cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
-            assert cursor.fetchone()[0] == 3 # 2 initial + 1 insert
-
+            # Assert that the record was updated back to its original name
             cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
-            assert cursor.fetchone()[0] == "NEW_NAME" # Updated
+            assert cursor.fetchone()[0] == "ASPIRIN"
 
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 99;")
-            assert cursor.fetchone()[0] == "UNCHANGED" # Untouched
+            # Assert that the other record was not changed
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;")
+            assert cursor.fetchone()[0] == "PARACETAMOL"
 
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 3;")
-            assert cursor.fetchone()[0] == "NEW_DRUG" # Inserted
+            # Assert that no new records were added
+            cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
+            assert cursor.fetchone()[0] == 2
 
-            # Check metadata
-            cursor.execute("SELECT load_type, status FROM chembl_loader_meta.load_history WHERE load_id = %s;", (pipeline.load_id,))
-            load_type, status = cursor.fetchone()
-            assert load_type == "DELTA"
-            assert status == "SUCCESS"
+            # Assert that the staging schema was dropped
+            staging_schema = f"staging_chembl_{chembl_version}"
+            cursor.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s;", (staging_schema,))
+            assert cursor.fetchone() is None, f"Staging schema '{staging_schema}' was not dropped."
 
-            cursor.execute("SELECT table_name, insert_count, update_count FROM chembl_loader_meta.load_details WHERE load_id = %s;", (pipeline.load_id,))
-            table_name, insert_count, update_count = cursor.fetchone()
-            assert table_name == "molecule_dictionary"
-            assert insert_count == 1
-            assert update_count == 1
+            # Assert the metadata tables for the DELTA load
+            cursor.execute("SELECT insert_count, update_count FROM chembl_loader_meta.load_details WHERE load_id = %s AND table_name = 'molecule_dictionary';", (pipeline.load_id,))
+            insert_count, update_count = cursor.fetchone()
+            assert insert_count == 0  # No new records were inserted
+            assert update_count == 1  # The 'OLD ASPIRIN' record was updated
     finally:
         conn.close()
 

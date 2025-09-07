@@ -3,7 +3,7 @@ from pathlib import Path
 from py_load_chembl import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
-from py_load_chembl import schema_parser
+from py_load_chembl.db_schemas import CHEMBL_SCHEMAS
 
 
 class LoaderPipeline:
@@ -104,11 +104,15 @@ class LoaderPipeline:
 
         print("\n--- Stage: Full Load ---")
 
+        # Clean the public schema to ensure idempotency. This drops all existing tables.
+        self.adapter.clean_schema("public")
+
         # The adapter's bulk_load_table for postgres uses pg_restore, which is a full restore.
         # The table_name parameter is ignored in this specific implementation.
         self.adapter.bulk_load_table(
-            table_name="all", # Parameter is ignored by pg_restore implementation
-            data_source=self.pg_dump_path
+            table_name="all",  # Parameter is ignored by pg_restore implementation
+            data_source=self.pg_dump_path,
+            schema="public",  # Explicitly restore to public schema
         )
         self._log_load_details(table_name="all_tables_via_pg_restore", insert_count=-1)
 
@@ -118,109 +122,64 @@ class LoaderPipeline:
 
     def _execute_delta_load(self):
         """
-        Handles the delta data load stage by parsing the DDL, and then iterating
-        through each table to stage, merge, and clean up.
+        Handles the delta data load stage by loading the new ChEMBL release into a
+        temporary staging schema and then merging the data into the production schema.
         """
         if not self.adapter or not self.pg_dump_path:
-            raise RuntimeError("Adapter and data path must be configured for delta load.")
+            raise RuntimeError("An adapter and data path must be configured for a delta load.")
 
         print("\n--- Stage: Delta Load ---")
-
-        # Define schema and paths
-        staging_schema = "staging"
+        staging_schema = f"staging_chembl_{self.chembl_version}"
         target_schema = "public"
-        archive_base_dir = f"chembl_{self.chembl_version}_postgresql"
-
-        # It's common for DDL files to have a naming convention.
-        ddl_file_path_in_archive = f"{archive_base_dir}/chembl_{self.chembl_version}_ddl.sql"
-
-        # Data files are usually in a subdirectory. Let's check a few common names.
-        data_dir_in_archive = f"{archive_base_dir}/chembl_{self.chembl_version}_data"
-
-        # 1. Extract and parse the DDL file to get all table schemas in order
-        print(f"Extracting DDL file: {ddl_file_path_in_archive}")
-        ddl_file = self._extract_file_from_archive(self.pg_dump_path, ddl_file_path_in_archive)
-        ddl_content = ddl_file.read_text()
-
-        print("Parsing DDL and sorting tables by dependency...")
-        all_tables = schema_parser.parse_chembl_ddl(ddl_content)
-        print(f"Found {len(all_tables)} tables to process.")
-
-        # 2. Create staging schema
-        self.adapter.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {staging_schema};")
-
-        # 3. Loop through each table and process it
-        for table in all_tables:
-            print(f"\n--- Processing table: {table.name} ---")
-            data_file = None
-            try:
-                # a. Extract the table's data file
-                data_file_path_in_archive = f"{data_dir_in_archive}/{table.name}.tsv"
-                data_file = self._extract_file_from_archive(self.pg_dump_path, data_file_path_in_archive)
-
-                # b. Create staging table
-                print(f"Creating staging table: {staging_schema}.{table.name}")
-                column_defs = ", ".join(f'"{c.name}" {c.dtype}' for c in table.columns)
-                create_staging_sql = f'CREATE UNLOGGED TABLE {staging_schema}."{table.name}" ({column_defs});'
-                self.adapter.execute_ddl(create_staging_sql)
-
-                # c. Load data into staging
-                self.adapter.bulk_load_table(
-                    table_name=f'"{table.name}"', # Quote to handle reserved keywords
-                    data_source=data_file,
-                    schema=staging_schema
-                )
-
-                # d. Merge data
-                all_columns = [c.name for c in table.columns]
-                merge_stats = self.adapter.execute_merge(
-                    source_table=f'{staging_schema}."{table.name}"',
-                    target_table=f'{target_schema}."{table.name}"',
-                    primary_keys=table.primary_keys,
-                    all_columns=all_columns
-                )
-
-                # e. Log results
-                self._log_load_details(
-                    table_name=table.name,
-                    stage_record_count=0,  # Placeholder, could be implemented with a SELECT COUNT(*)
-                    insert_count=merge_stats.get("inserted", 0),
-                    update_count=merge_stats.get("updated", 0)
-                )
-
-            finally:
-                # f. Cleanup
-                print(f"Cleaning up staging table and data file for {table.name}...")
-                self.adapter.execute_sql(f'DROP TABLE IF EXISTS {staging_schema}."{table.name}";')
-                if data_file and data_file.exists():
-                    data_file.unlink()
-
-        # Cleanup the extracted DDL file
-        if ddl_file and ddl_file.exists():
-            ddl_file.unlink()
-
-    def _extract_file_from_archive(self, archive_path: Path, file_to_extract: str) -> Path:
-        """Extracts a single file from the .tar.gz archive to the output directory."""
-        import tarfile
-        print(f"Extracting '{file_to_extract}' from archive...")
-
-        output_path = self.output_dir / Path(file_to_extract).name
 
         try:
-            with tarfile.open(archive_path, "r:gz") as tar:
-                member = tar.getmember(file_to_extract)
-                with tar.extractfile(member) as f_in, open(output_path, "wb") as f_out:
-                    f_out.write(f_in.read())
-            print(f"Successfully extracted to '{output_path}'")
-            return output_path
-        except KeyError:
-            # This can happen with test data that has a different structure
-            print(f"Warning: Could not find '{file_to_extract}' in the archive. This may be expected during testing.")
-            # Create a dummy file to allow the pipeline to proceed
-            output_path.touch()
-            return output_path
-        except tarfile.TarError as e:
-            raise IOError(f"Failed to extract from {archive_path}: {e}") from e
+            # 1. Load new data into a temporary staging schema
+            print(f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'...")
+            self.adapter.bulk_load_table(
+                table_name="all",  # This is ignored by the pg_restore implementation
+                data_source=self.pg_dump_path,
+                schema=staging_schema,
+            )
+            print("Staging load complete.")
+
+            # 2. Get the list of tables to merge from the staging schema
+            tables_to_merge = self.adapter.get_table_names(schema=staging_schema)
+            print(f"Found {len(tables_to_merge)} tables in staging schema to process.")
+
+            # 3. Iterate and merge each table
+            for table_name in tables_to_merge:
+                print(f"\n--- Processing table: {table_name} ---")
+
+                table_schema_info = CHEMBL_SCHEMAS.get(table_name)
+                if not table_schema_info or not table_schema_info.primary_keys:
+                    print(f"Warning: No primary key definition for table '{table_name}'. Skipping merge.")
+                    continue
+
+                # Introspect the staging table to get all column names for the merge
+                all_columns = self.adapter.get_column_names(schema=staging_schema, table_name=table_name)
+                if not all_columns:
+                    print(f"Warning: Could not find columns for table '{table_name}'. Skipping merge.")
+                    continue
+
+                # Perform the merge from staging to production
+                merge_stats = self.adapter.execute_merge(
+                    source_table=f'{staging_schema}."{table_name}"',
+                    target_table=f'{target_schema}."{table_name}"',
+                    primary_keys=table_schema_info.primary_keys,
+                    all_columns=all_columns,
+                )
+
+                self._log_load_details(
+                    table_name=table_name,
+                    insert_count=merge_stats.get("inserted", 0),
+                    update_count=merge_stats.get("updated", 0),
+                )
+
+        finally:
+            # 4. Clean up by dropping the staging schema
+            print(f"\nCleaning up temporary staging schema '{staging_schema}'...")
+            self.adapter.execute_sql(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
+            print("Cleanup complete.")
 
     def _setup_logging(self):
         """Initializes metadata tables and logs the start of the process."""

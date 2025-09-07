@@ -94,8 +94,8 @@ class PostgresAdapter(DatabaseAdapter):
         """
         data_source_path = Path(data_source)
         if data_source_path.name.endswith(".tar.gz"):
-            print(f"Initiating full database restore from '{data_source_path}'...")
-            self._run_pg_restore(data_source_path)
+            print(f"Initiating full database restore from '{data_source_path}' into schema '{schema}'...")
+            self._run_pg_restore(data_source_path, schema=schema)
             print("Database restore completed.")
         elif data_source_path.name.endswith(".tsv"):
             print(f"Initiating COPY load into '{schema}.{table_name}' from '{data_source_path}'...")
@@ -181,8 +181,42 @@ class PostgresAdapter(DatabaseAdapter):
             conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_DEFAULT)
 
 
-    def _run_pg_restore(self, dump_archive_path: Path):
-        """Extracts the dump and runs the pg_restore command."""
+    def clean_schema(self, schema: str) -> None:
+        """Drops and recreates a schema."""
+        print(f"Cleaning schema '{schema}'...")
+        self.execute_sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
+        self.execute_sql(f"CREATE SCHEMA {schema};")
+        print(f"Schema '{schema}' has been reset.")
+
+    def get_table_names(self, schema: str) -> List[str]:
+        """Returns a list of table names in a given schema."""
+        print(f"Fetching table names from schema '{schema}'...")
+        sql = """
+            SELECT table_name
+            FROM information_schema.tables
+            WHERE table_schema = %s
+            ORDER BY table_name;
+        """
+        results = self.execute_sql(sql, (schema,), fetch='all')
+        return [row[0] for row in results]
+
+    def get_column_names(self, schema: str, table_name: str) -> List[str]:
+        """Returns a list of column names for a given table in a schema."""
+        print(f"Fetching column names for '{schema}.{table_name}'...")
+        sql = """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position;
+        """
+        results = self.execute_sql(sql, (schema, table_name), fetch='all')
+        return [row[0] for row in results]
+
+    def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None):
+        """
+        Extracts the dump and runs the pg_restore command.
+        If a schema is provided, it restores into that schema.
+        """
         if not shutil.which("pg_restore"):
             raise FileNotFoundError(
                 "'pg_restore' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
@@ -215,8 +249,13 @@ class PostgresAdapter(DatabaseAdapter):
                 f"--jobs={jobs}",
                 "--no-owner",      # Often desirable when restoring to a different system
                 "--no-privileges", # ACLs are often environment-specific
-                str(dump_dir),
             ]
+            # If a schema is specified, create it and add the --schema flag to pg_restore
+            if schema:
+                self.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {schema};")
+                command.append(f"--schema={schema}")
+
+            command.append(str(dump_dir))
 
             env = os.environ.copy()
             env["PGHOST"] = self._parsed_uri.hostname or "localhost"
