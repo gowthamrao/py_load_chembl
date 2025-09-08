@@ -26,9 +26,17 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], columns: List[str]) -> None:
+    def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], all_columns: List[str]) -> Dict[str, int]:
         """
         Executes an efficient MERGE/UPSERT operation from source (staging) to target (production).
+        """
+        pass
+
+    @abstractmethod
+    def migrate_schema(self, source_schema: str, source_table_name: str, target_schema: str, target_table_name: str) -> None:
+        """
+        Compares the schema of a source and target table and applies additive changes
+        (e.g., new columns) to the target table.
         """
         pass
 

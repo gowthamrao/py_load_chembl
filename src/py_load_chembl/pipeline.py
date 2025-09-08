@@ -68,12 +68,14 @@ class LoaderPipeline:
         else:
             self.chembl_version = int(self.version_str)
 
-        # For now, we only support postgres, so we directly get the pg_dump url
-        pg_dump_url, checksums_url = downloader.get_chembl_file_urls(self.chembl_version)
+        # For DELTA mode, we need the plain SQL dump to load into a staging schema.
+        # For FULL mode, the custom .tar.gz format is faster with pg_restore.
+        use_plain_sql = self.mode == 'DELTA'
+        dump_url, checksums_url = downloader.get_chembl_file_urls(self.chembl_version, plain_sql=use_plain_sql)
 
-        print(f"Downloading PostgreSQL dump from: {pg_dump_url}")
+        print(f"Requesting ChEMBL dump from: {dump_url}")
         # Check if file already exists and is valid before downloading
-        local_file = self.output_dir / pg_dump_url.split("/")[-1]
+        local_file = self.output_dir / dump_url.split("/")[-1]
         if local_file.exists():
             print(f"File '{local_file.name}' already exists. Verifying checksum...")
             if downloader.verify_checksum(local_file, checksums_url):
@@ -149,6 +151,14 @@ class LoaderPipeline:
             # 3. Iterate and merge each table
             for table_name in tables_to_merge:
                 print(f"\n--- Processing table: {table_name} ---")
+
+                # 3a. Compare schemas and migrate if necessary before merging
+                self.adapter.migrate_schema(
+                    source_schema=staging_schema,
+                    source_table_name=table_name,
+                    target_schema=target_schema,
+                    target_table_name=table_name,
+                )
 
                 table_schema_info = CHEMBL_SCHEMAS.get(table_name)
                 if not table_schema_info or not table_schema_info.primary_keys:

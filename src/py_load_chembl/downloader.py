@@ -34,14 +34,24 @@ def get_latest_chembl_version() -> int:
     return max(int(v) for v in dir_names)
 
 
-def get_chembl_file_urls(version: int) -> Tuple[str, str]:
+def get_chembl_file_urls(version: int, plain_sql: bool = True) -> Tuple[str, str]:
     """
     Constructs the URLs for the PostgreSQL dump and checksums file for a given version.
+
+    Args:
+        version: The ChEMBL version number.
+        plain_sql: If True, returns the URL for the plain-text SQL dump (.sql.gz).
+                   Otherwise, returns the URL for the custom-format dump (.tar.gz).
     """
     version_url = f"{BASE_URL}/chembl_{version}"
-    pg_dump_url = f"{version_url}/chembl_{version}_postgresql.tar.gz"
+    if plain_sql:
+        # For delta loads, we prefer the plain SQL dump to manipulate it for staging.
+        dump_url = f"{version_url}/chembl_{version}_postgresql.sql.gz"
+    else:
+        # For full loads, the pg_restore format can be faster.
+        dump_url = f"{version_url}/chembl_{version}_postgresql.tar.gz"
     checksums_url = f"{version_url}/checksums.txt"
-    return pg_dump_url, checksums_url
+    return dump_url, checksums_url
 
 
 def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:

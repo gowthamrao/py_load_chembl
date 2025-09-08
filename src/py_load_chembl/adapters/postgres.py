@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import gzip
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
@@ -89,11 +90,16 @@ class PostgresAdapter(DatabaseAdapter):
     ) -> None:
         """
         Performs high-performance native bulk loading.
+        - If data_source is a .sql.gz archive, uses psql for a schema-specific restore.
         - If data_source is a .tar.gz archive, uses pg_restore for a full restore.
         - If data_source is a .tsv file, uses the COPY command for a single table.
         """
         data_source_path = Path(data_source)
-        if data_source_path.name.endswith(".tar.gz"):
+        if data_source_path.name.endswith(".sql.gz"):
+            print(f"Initiating schema-specific restore from '{data_source_path}' using psql...")
+            self._run_psql_restore(data_source_path, schema=schema)
+            print("Schema-specific restore completed.")
+        elif data_source_path.name.endswith(".tar.gz"):
             print(f"Initiating full database restore from '{data_source_path}' into schema '{schema}'...")
             self._run_pg_restore(data_source_path, schema=schema)
             print("Database restore completed.")
@@ -211,6 +217,140 @@ class PostgresAdapter(DatabaseAdapter):
         """
         results = self.execute_sql(sql, (schema, table_name), fetch='all')
         return [row[0] for row in results]
+
+    def migrate_schema(self, source_schema: str, source_table_name: str, target_schema: str, target_table_name: str):
+        """
+        Compares the schema of a source and target table. If the target table does not exist,
+        it is created. If it exists, additive changes (new columns) are applied.
+        """
+        print(f"Comparing schema for table '{target_table_name}'...")
+
+        # Check if target table exists
+        table_exists_sql = "SELECT to_regclass(%s);"
+        target_table_regclass = f'"{target_schema}"."{target_table_name}"'
+        result = self.execute_sql(table_exists_sql, (target_table_regclass,), fetch='one')
+
+        if result[0] is None:
+            # Target table does not exist, so create it based on the source table's structure
+            print(f"Target table '{target_table_regclass}' does not exist. Creating it now.")
+            create_sql = f'CREATE TABLE {target_table_regclass} (LIKE "{source_schema}"."{source_table_name}" INCLUDING ALL);'
+            self.execute_sql(create_sql)
+            print(f"Table '{target_table_regclass}' created successfully.")
+            return  # No further migration needed
+
+        # --- If table exists, proceed with column comparison ---
+
+        # Get column definitions for source table
+        source_cols_sql = """
+            SELECT column_name, data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s;
+        """
+        source_cols_result = self.execute_sql(source_cols_sql, (source_schema, source_table_name), fetch='all')
+        source_columns = {row[0]: {'type': row[1], 'length': row[2]} for row in source_cols_result}
+
+        # Get column names for target table
+        target_cols_sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
+        target_cols_result = self.execute_sql(target_cols_sql, (target_schema, target_table_name), fetch='all')
+        target_columns = {row[0] for row in target_cols_result}
+
+        # Find columns that are in the source but not in the target
+        new_columns = source_columns.keys() - target_columns
+
+        if not new_columns:
+            print("Schemas are identical. No migration needed.")
+            return
+
+        print(f"Found new columns to add: {', '.join(new_columns)}")
+
+        for col_name in sorted(list(new_columns)):
+            col_info = source_columns[col_name]
+            data_type = col_info['type']
+            if col_info['length']:
+                data_type = f"{data_type}({col_info['length']})"
+
+            alter_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN "{col_name}" {data_type};'
+            print(f"Applying schema change: {alter_sql}")
+            self.execute_sql(alter_sql)
+
+        print(f"Successfully migrated schema for table '{target_table_name}'.")
+
+    def _run_psql_restore(self, dump_archive_path: Path, schema: str):
+        """
+        Decompresses a .sql.gz dump and loads it into a specific schema using psql.
+        This is used for delta loads to load data into a staging schema.
+        """
+        if not shutil.which("psql"):
+            raise FileNotFoundError(
+                "'psql' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
+            )
+
+        print(f"Initiating PSQL restore from '{dump_archive_path}' into schema '{schema}'...")
+
+        # Prepare the environment for psql
+        env = os.environ.copy()
+        env["PGHOST"] = self._parsed_uri.hostname or "localhost"
+        env["PGPORT"] = str(self._parsed_uri.port or 5432)
+        env["PGUSER"] = self._parsed_uri.username or ""
+        if self._parsed_uri.password:
+            env["PGPASSWORD"] = self._parsed_uri.password
+
+        # Create the target schema before running psql
+        self.execute_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
+
+        command = [
+            "psql",
+            f"--dbname={self._parsed_uri.path.lstrip('/')}",
+            "--quiet",  # Suppress informational messages
+            "--no-psqlrc",  # Do not read psqlrc file
+            "--single-transaction",  # Run the entire script in a single transaction
+            "-v", "ON_ERROR_STOP=1",  # Exit on error
+        ]
+
+        try:
+            # We decompress the file and pipe its contents along with a prepended
+            # command to psql. This avoids writing a large intermediate file to disk.
+            with gzip.open(dump_archive_path, 'rt', encoding='utf-8') as f_in:
+                # Prepend the command to set the schema for this session
+                # All tables/indexes/etc. in the script will be created in the target schema.
+                prepended_sql = f'SET search_path = "{schema}", public;\n'
+
+                # Use subprocess.Popen to handle streaming the input
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+
+                # Write the prepended command first
+                process.stdin.write(prepended_sql)
+
+                # Stream the rest of the file to stdin
+                shutil.copyfileobj(f_in, process.stdin)
+                process.stdin.close()  # Close stdin to signal end of input
+
+                stdout, stderr = process.communicate()
+
+                if process.returncode != 0:
+                    error_message = (
+                        f"psql failed with exit code {process.returncode}.\n"
+                        f"--- STDOUT ---\n{stdout}\n"
+                        f"--- STDERR ---\n{stderr}"
+                    )
+                    raise RuntimeError(error_message)
+
+            print(f"Successfully loaded dump into schema '{schema}'.")
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"psql command not found. Make sure PostgreSQL client tools are installed and in your PATH."
+            )
+        except Exception as e:
+            # Catch other potential errors during process execution
+            raise RuntimeError(f"An error occurred during psql execution: {e}") from e
 
     def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None):
         """

@@ -1,6 +1,7 @@
 import os
 import pytest
 import psycopg2
+import gzip
 from pathlib import Path
 import requests_mock
 
@@ -231,3 +232,110 @@ def _cleanup_db(pg_config):
     except psycopg2.OperationalError:
         # This can happen if the DB doesn't exist yet, which is fine.
         pass
+
+
+def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_mock):
+    """
+    Tests the delta load with schema evolution (new tables and new columns).
+    1. Mocks and loads a "v1" ChEMBL dump (as a FULL load).
+    2. Mocks and loads a "v2" ChEMBL dump (as a DELTA load), which contains a new
+       table and a new column in an existing table.
+    3. Asserts that the new table was created in the production schema.
+    4. Asserts that the new column was added to the existing table.
+    5. Asserts that data was correctly inserted/updated.
+    """
+    # --- 1. Define Schemas and Data for two ChEMBL versions ---
+    v1_version = "98"
+    v2_version = "99"
+
+    # Schema for v1
+    v1_sql = """
+    CREATE TABLE molecule_dictionary (molregno integer PRIMARY KEY, pref_name text, chembl_id text);
+    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN', 'CHEMBL1');
+    CREATE TABLE compound_structures (molregno integer PRIMARY KEY, canonical_smiles text);
+    INSERT INTO compound_structures VALUES (1, 'CC(=O)Oc1ccccc1C(=O)O');
+    """
+
+    # Schema for v2 (adds a new column and a new table)
+    v2_sql = """
+    CREATE TABLE molecule_dictionary (molregno integer PRIMARY KEY, pref_name text, chembl_id text, is_natural_product smallint);
+    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN V2', 'CHEMBL1', 0); -- Update existing
+    INSERT INTO molecule_dictionary VALUES (2, 'NEW DRUG', 'CHEMBL2', 1); -- Insert new
+    CREATE TABLE compound_structures (molregno integer PRIMARY KEY, canonical_smiles text);
+    INSERT INTO compound_structures VALUES (1, 'CC(=O)Oc1ccccc1C(=O)O');
+    CREATE TABLE target_dictionary (tid integer PRIMARY KEY, pref_name text, target_type text);
+    INSERT INTO target_dictionary VALUES (101, 'Cytochrome P450', 'ENZYME');
+    """
+
+    # --- 2. Setup Mocks and Files ---
+    output_dir = tmp_path / "chembl_data"
+    output_dir.mkdir()
+
+    # Create gzipped SQL files
+    v1_path = output_dir / f"chembl_{v1_version}_postgresql.tar.gz" # Full load uses tar.gz
+    v2_path = output_dir / f"chembl_{v2_version}_postgresql.sql.gz"  # Delta load uses sql.gz
+    with open(v1_path, "wb") as f: # Not a real tar.gz, but pg_restore is mocked
+        f.write(b"dummy tar.gz content")
+    with gzip.open(v2_path, "wt") as f:
+        f.write(v2_sql)
+
+    # Mock URLs
+    v1_dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{v1_version}/chembl_{v1_version}_postgresql.tar.gz"
+    v2_dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{v2_version}/chembl_{v2_version}_postgresql.sql.gz"
+    v1_checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{v1_version}/checksums.txt"
+    v2_checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{v2_version}/checksums.txt"
+    requests_mock.get(v1_checksum_url, text=f"md5  {v1_path.name}")
+    requests_mock.get(v2_checksum_url, text=f"md5  {v2_path.name}")
+    requests_mock.get(v1_dump_url, content=v1_path.read_bytes())
+    requests_mock.get(v2_dump_url, content=v2_path.read_bytes())
+
+    # --- 3. Run FULL load for v1 ---
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+    _create_database(postgres_service)
+
+    # We need to mock pg_restore for the v1 full load, as we are not providing a real dump
+    def mock_pg_restore(self, dump_archive_path, schema):
+        print(f"MOCK pg_restore called for schema {schema}")
+        self.execute_sql(v1_sql)
+
+    original_pg_restore = PostgresAdapter._run_pg_restore
+    PostgresAdapter._run_pg_restore = mock_pg_restore
+
+    pipeline_v1 = LoaderPipeline(adapter, version=v1_version, mode="FULL", output_dir=output_dir)
+    pipeline_v1.run()
+
+    PostgresAdapter._run_pg_restore = original_pg_restore # Restore original method
+
+    # --- 4. Assert initial state after v1 load ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    with conn.cursor() as cursor:
+        cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
+        assert cursor.fetchone()[0] == 1
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary';")
+        assert len(cursor.fetchall()) == 3 # Should not have the new column yet
+        cursor.execute("SELECT to_regclass('public.target_dictionary');")
+        assert cursor.fetchone()[0] is None # New table should not exist yet
+
+    # --- 5. Run DELTA load for v2 ---
+    pipeline_v2 = LoaderPipeline(adapter, version=v2_version, mode="DELTA", output_dir=output_dir)
+    pipeline_v2.run()
+
+    # --- 6. Assert final state after v2 delta load ---
+    with conn.cursor() as cursor:
+        # Assert schema migration: new column exists
+        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary' AND column_name = 'is_natural_product';")
+        assert cursor.fetchone()[0] == 'is_natural_product'
+
+        # Assert schema migration: new table exists
+        cursor.execute("SELECT COUNT(*) FROM target_dictionary;")
+        assert cursor.fetchone()[0] == 1
+
+        # Assert data merge: update
+        cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
+        assert cursor.fetchone()[0] == 'ASPIRIN V2'
+
+        # Assert data merge: insert
+        cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
+        assert cursor.fetchone()[0] == 2
+
+    conn.close()
