@@ -1,6 +1,8 @@
 from typer.testing import CliRunner
+from unittest.mock import patch
 
 from py_load_chembl.cli import app
+from py_load_chembl.config import STANDARD_PROFILE_TABLES
 
 runner = CliRunner()
 
@@ -19,3 +21,51 @@ def test_load_command_help():
     assert "Downloads and loads ChEMBL data" in result.stdout
     assert "--target" in result.stdout
     assert "--mode" in result.stdout
+    assert "--profile" in result.stdout
+
+
+@patch('py_load_chembl.cli.api.full_load')
+def test_load_command_with_standard_profile(mock_full_load):
+    """Tests that using --profile standard calls the API with the correct table list."""
+    result = runner.invoke(
+        app,
+        [
+            "load",
+            "--target", "postgresql://fake",
+            "--profile", "standard",
+        ],
+    )
+    assert result.exit_code == 0
+    mock_full_load.assert_called_once()
+    # Check the keyword arguments passed to the mocked function
+    call_args, call_kwargs = mock_full_load.call_args
+    assert call_kwargs["include_tables"] == STANDARD_PROFILE_TABLES
+
+
+def test_load_command_with_mutually_exclusive_options(caplog):
+    """Tests that using --profile and --include-tables together fails."""
+    result = runner.invoke(
+        app,
+        [
+            "load",
+            "--target", "postgresql://fake",
+            "--profile", "standard",
+            "--include-tables", "molecule_dictionary",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "--profile and --include-tables are mutually exclusive" in caplog.text
+
+
+def test_load_command_with_invalid_profile(caplog):
+    """Tests that using an invalid profile name fails."""
+    result = runner.invoke(
+        app,
+        [
+            "load",
+            "--target", "postgresql://fake",
+            "--profile", "invalid_profile_name",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "Invalid profile 'invalid_profile_name'" in caplog.text
