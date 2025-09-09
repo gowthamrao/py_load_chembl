@@ -604,3 +604,86 @@ def test_full_load_with_table_subset(postgres_service, tmp_path, requests_mock):
     A unit test mocking subprocess.run is a better approach.
     """
     pass
+
+
+def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock, caplog):
+    """
+    Tests that the full load process correctly uses the pre/post load optimizations.
+    Specifically, it should drop pre-existing constraints and indexes before the load.
+    """
+    # --- 1. Run a normal full load first to get the database into a known state ---
+    test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog)
+
+    # --- 2. Manually add extra objects to the database to simulate a dirty state ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    try:
+        with conn.cursor() as cursor:
+            # Add a dummy, non-standard index
+            cursor.execute("CREATE INDEX idx_dummy_test ON public.molecule_dictionary (pref_name);")
+            # Add a dummy, non-standard foreign key.
+            # First, add a dummy table to reference.
+            cursor.execute("CREATE TABLE dummy_ref_table (id integer primary key);")
+            cursor.execute("INSERT INTO dummy_ref_table (id) VALUES (1), (2);")
+            # Then add a column to molecule_dictionary to create the FK on.
+            cursor.execute("ALTER TABLE public.molecule_dictionary ADD COLUMN dummy_ref_id INTEGER;")
+            cursor.execute("UPDATE public.molecule_dictionary SET dummy_ref_id = molregno;")
+            cursor.execute("""
+                ALTER TABLE public.molecule_dictionary
+                ADD CONSTRAINT fk_dummy_test
+                FOREIGN KEY (dummy_ref_id) REFERENCES public.dummy_ref_table(id);
+            """)
+        conn.commit()
+    finally:
+        conn.close()
+
+    # --- 3. Run the FULL load again. The optimization logic should drop the dummy objects. ---
+    # We can reuse the mocks from the first run since the URLs are the same.
+    chembl_version = "99"
+    output_dir = tmp_path / "chembl_data"
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+
+    # We need to use the same mock for _acquire_data as the main full load test
+    original_acquire_data = LoaderPipeline._acquire_data
+    def mock_acquire_data(self):
+        self.chembl_version = int(self.version_str)
+        self.mode = 'DELTA'
+        original_acquire_data(self)
+        self.mode = 'FULL'
+    LoaderPipeline._acquire_data = mock_acquire_data
+
+    pipeline = LoaderPipeline(
+        adapter=adapter,
+        version=chembl_version,
+        mode="FULL",
+        output_dir=output_dir,
+    )
+    pipeline.run()
+
+    LoaderPipeline._acquire_data = original_acquire_data # Restore
+
+    # --- 4. Assert that the dummy objects were dropped ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    try:
+        with conn.cursor() as cursor:
+            # Check that the dummy index is gone
+            cursor.execute("""
+                SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_dummy_test';
+            """)
+            assert cursor.fetchone() is None, "Dummy index should have been dropped by the full load."
+
+            # Check that the dummy foreign key is gone
+            cursor.execute("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_schema = 'public' AND constraint_name = 'fk_dummy_test';
+            """)
+            assert cursor.fetchone() is None, "Dummy foreign key should have been dropped by the full load."
+
+            # Check that the legitimate primary key still exists
+            cursor.execute("""
+                SELECT 1 FROM information_schema.table_constraints
+                WHERE constraint_schema = 'public' AND constraint_name = 'molecule_dictionary_pkey';
+            """)
+            assert cursor.fetchone() is not None, "Legitimate primary key should exist."
+
+    finally:
+        conn.close()

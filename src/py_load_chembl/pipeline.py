@@ -118,7 +118,12 @@ class LoaderPipeline:
 
         logger.info("--- Stage: Full Load ---")
 
-        # Clean the public schema to ensure idempotency. This drops all existing tables.
+        # In a full load, we first capture and drop all existing constraints and indexes from the target schema.
+        # This is to ensure that the load is not slowed down by existing objects, and that any
+        # objects not in the new dump are correctly removed.
+        self.adapter.optimize_pre_load(schema="public")
+
+        # Then, clean the public schema to ensure idempotency. This drops all existing tables.
         self.adapter.clean_schema("public")
 
         # The adapter's bulk_load_table for postgres uses pg_restore, which is a full restore.
