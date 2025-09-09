@@ -8,6 +8,7 @@ from py_load_chembl.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 
+
 def full_load(
     connection_string: str,
     chembl_version: str = "latest",

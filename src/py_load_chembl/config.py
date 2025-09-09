@@ -10,6 +10,7 @@ class Representation(str, Enum):
     FULL: All tables in the ChEMBL dump.
     STANDARD: A curated subset of the most commonly used tables.
     """
+
     FULL = "full"
     STANDARD = "standard"
 

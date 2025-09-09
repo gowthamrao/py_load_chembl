@@ -4,10 +4,12 @@ import os
 import sys
 from typing import Dict, Any
 
+
 class JsonFormatter(logging.Formatter):
     """
     Formats log records as a JSON string.
     """
+
     def format(self, record: logging.LogRecord) -> str:
         log_object: Dict[str, Any] = {
             "timestamp": self.formatTime(record, self.datefmt),
@@ -19,6 +21,7 @@ class JsonFormatter(logging.Formatter):
             log_object["exception"] = self.formatException(record.exc_info)
 
         return json.dumps(log_object)
+
 
 def setup_logging():
     """

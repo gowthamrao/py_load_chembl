@@ -23,6 +23,12 @@ psycopg2-binary = "^2.9.9"
 rich = "^13.7.1"
 sqlparse = "^0.5.0"
 pytest-docker = "^3.2.3"
+ruff = "^0.1.0"
+mypy = "^1.5.0"
+black = "^23.9.0"
+types-requests = "^2.31.0"
+types-psycopg2 = "^2.9.21"
+pytest-cov = "^4.1.0"
 
 [tool.poetry.scripts]
 py-load-chembl = "py_load_chembl.cli:main"
@@ -31,6 +37,7 @@ py-load-chembl = "py_load_chembl.cli:main"
 pythonpath = [
   "src"
 ]
+addopts = "--cov=src/py_load_chembl --cov-report=term-missing"
 markers = [
     "integration: marks tests as integration tests (requires docker)",
 ]

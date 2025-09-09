@@ -1,9 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from pathlib import Path
 
-class DatabaseAdapter(ABC):
 
+class DatabaseAdapter(ABC):
     @abstractmethod
     def connect(self) -> Any:
         """Establishes a connection to the target database."""
@@ -15,7 +15,13 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def bulk_load_table(self, table_name: str, data_source: Path | str, schema: str = "public", options: Dict[str, Any] = {}) -> None:
+    def bulk_load_table(
+        self,
+        table_name: str,
+        data_source: Path | str,
+        schema: str = "public",
+        options: Dict[str, Any] = {},
+    ) -> None:
         """
         Performs high-performance native bulk loading into a specific table.
         Args:
@@ -26,7 +32,40 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], all_columns: List[str]) -> Dict[str, int]:
+    def execute_sql(
+        self, sql: str, params: Optional[tuple] = None, fetch: Optional[str] = None
+    ) -> Any:
+        """Executes an arbitrary SQL command."""
+        pass
+
+    @abstractmethod
+    def create_metadata_tables(self) -> None:
+        """Creates the metadata tracking tables if they don't exist."""
+        pass
+
+    @abstractmethod
+    def clean_schema(self, schema: str) -> None:
+        """Drops and recreates a schema."""
+        pass
+
+    @abstractmethod
+    def get_table_names(self, schema: str) -> List[str]:
+        """Returns a list of table names in a given schema."""
+        pass
+
+    @abstractmethod
+    def get_column_names(self, schema: str, table_name: str) -> List[str]:
+        """Returns a list of column names for a given table in a schema."""
+        pass
+
+    @abstractmethod
+    def execute_merge(
+        self,
+        source_table: str,
+        target_table: str,
+        primary_keys: List[str],
+        all_columns: List[str],
+    ) -> Dict[str, int]:
         """
         Executes an efficient MERGE/UPSERT operation from source (staging) to target (production).
         """
@@ -57,7 +96,9 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def get_column_definitions(self, schema: str, table_name: str) -> List[Dict[str, Any]]:
+    def get_column_definitions(
+        self, schema: str, table_name: str
+    ) -> List[Dict[str, Any]]:
         """
         Retrieves the column definitions for a given table.
 

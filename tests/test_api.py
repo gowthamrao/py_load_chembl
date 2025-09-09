@@ -4,10 +4,10 @@ from pathlib import Path
 
 from py_load_chembl import api
 
-class TestApi(unittest.TestCase):
 
-    @patch('py_load_chembl.api.LoaderPipeline')
-    @patch('py_load_chembl.api.PostgresAdapter')
+class TestApi(unittest.TestCase):
+    @patch("py_load_chembl.api.LoaderPipeline")
+    @patch("py_load_chembl.api.PostgresAdapter")
     def test_full_load_api_call(self, mock_adapter, mock_pipeline):
         """Tests that the full_load API function initializes and runs the pipeline correctly."""
         mock_pipeline_instance = MagicMock()
@@ -20,7 +20,9 @@ class TestApi(unittest.TestCase):
             include_tables=["table1", "table2"],
         )
 
-        mock_adapter.assert_called_once_with(connection_string="postgresql://user:pass@host/db")
+        mock_adapter.assert_called_once_with(
+            connection_string="postgresql://user:pass@host/db"
+        )
 
         mock_pipeline.assert_called_once_with(
             adapter=mock_adapter.return_value,
@@ -32,8 +34,8 @@ class TestApi(unittest.TestCase):
 
         mock_pipeline_instance.run.assert_called_once()
 
-    @patch('py_load_chembl.api.LoaderPipeline')
-    @patch('py_load_chembl.api.PostgresAdapter')
+    @patch("py_load_chembl.api.LoaderPipeline")
+    @patch("py_load_chembl.api.PostgresAdapter")
     def test_delta_load_api_call(self, mock_adapter, mock_pipeline):
         """Tests that the delta_load API function initializes and runs the pipeline correctly."""
         mock_pipeline_instance = MagicMock()
@@ -46,7 +48,9 @@ class TestApi(unittest.TestCase):
             include_tables=["table3"],
         )
 
-        mock_adapter.assert_called_once_with(connection_string="postgresql://user:pass@host/db")
+        mock_adapter.assert_called_once_with(
+            connection_string="postgresql://user:pass@host/db"
+        )
 
         mock_pipeline.assert_called_once_with(
             adapter=mock_adapter.return_value,

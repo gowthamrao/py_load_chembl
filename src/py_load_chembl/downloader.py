@@ -2,7 +2,7 @@ import hashlib
 import re
 import logging
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 
 import requests
 from rich.progress import (
@@ -75,7 +75,9 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
         initial_size = local_path.stat().st_size
         headers["Range"] = f"bytes={initial_size}-"
         file_mode = "ab"
-        logger.info(f"Resuming download for {local_filename} from {initial_size} bytes.")
+        logger.info(
+            f"Resuming download for {local_filename} from {initial_size} bytes."
+        )
     else:
         logger.info(f"Starting new download for {local_filename}.")
 
@@ -95,7 +97,12 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
                 "•",
                 TimeRemainingColumn(),
             ) as progress:
-                task_id = progress.add_task("download", total=total_size, initial=initial_size, filename=local_filename)
+                task_id = progress.add_task(
+                    "download",
+                    total=total_size,
+                    initial=initial_size,
+                    filename=local_filename,
+                )
                 with open(local_path, file_mode) as f:
                     for chunk in r.iter_content(chunk_size=8192):
                         f.write(chunk)
@@ -111,13 +118,17 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
     """
     Verifies the MD5 checksum of a downloaded file.
     """
-    logger.info(f"Verifying checksum for {file_path.name} using checksums from {checksums_url}")
+    logger.info(
+        f"Verifying checksum for {file_path.name} using checksums from {checksums_url}"
+    )
     try:
         response = requests.get(checksums_url, timeout=30)
         response.raise_for_status()
         checksums_text = response.text
     except requests.RequestException as e:
-        raise ConnectionError(f"Could not download checksums file from {checksums_url}: {e}") from e
+        raise ConnectionError(
+            f"Could not download checksums file from {checksums_url}: {e}"
+        ) from e
 
     expected_checksum = None
     for line in checksums_text.splitlines():
@@ -128,7 +139,9 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
             break
 
     if not expected_checksum:
-        raise ValueError(f"Could not find checksum for {file_path.name} in {checksums_url}")
+        raise ValueError(
+            f"Could not find checksum for {file_path.name} in {checksums_url}"
+        )
 
     hasher = hashlib.md5()
     with open(file_path, "rb") as f:
@@ -138,8 +151,22 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
 
     is_valid = actual_checksum == expected_checksum
     if is_valid:
-        logger.info("Checksum valid.", extra={"file": file_path.name, "expected": expected_checksum, "actual": actual_checksum})
+        logger.info(
+            "Checksum valid.",
+            extra={
+                "file": file_path.name,
+                "expected": expected_checksum,
+                "actual": actual_checksum,
+            },
+        )
     else:
-        logger.warning("Checksum invalid.", extra={"file": file_path.name, "expected": expected_checksum, "actual": actual_checksum})
+        logger.warning(
+            "Checksum invalid.",
+            extra={
+                "file": file_path.name,
+                "expected": expected_checksum,
+                "actual": actual_checksum,
+            },
+        )
 
     return is_valid
