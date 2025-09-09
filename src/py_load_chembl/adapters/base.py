@@ -33,10 +33,16 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
-    def migrate_schema(self, source_schema: str, source_table_name: str, target_schema: str, target_table_name: str) -> None:
+    def handle_obsolete_records(self, source_schema: str, target_schema: str) -> int:
         """
-        Compares the schema of a source and target table and applies additive changes
-        (e.g., new columns) to the target table.
+        Handles obsolete records based on the chembl_id_lookup table.
+
+        This method should compare the source and target chembl_id_lookup tables
+        and update the status of any entities that have become obsolete in the
+        new ChEMBL version.
+
+        Returns:
+            The number of records marked as obsolete.
         """
         pass
 
@@ -48,4 +54,15 @@ class DatabaseAdapter(ABC):
     @abstractmethod
     def optimize_post_load(self, schema: str) -> None:
         """Re-enables constraints, rebuilds indexes, and runs statistics gathering (e.g., ANALYZE)."""
+        pass
+
+    @abstractmethod
+    def get_column_definitions(self, schema: str, table_name: str) -> List[Dict[str, Any]]:
+        """
+        Retrieves the column definitions for a given table.
+
+        Returns:
+            A list of dictionaries, where each dictionary represents a column
+            and contains keys like 'name', 'type', 'length'.
+        """
         pass

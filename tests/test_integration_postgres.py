@@ -390,113 +390,6 @@ def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_m
     conn.close()
 
 
-def test_delta_load_with_soft_deletes(postgres_service, tmp_path, requests_mock):
-    """
-    Tests that the delta load correctly handles soft deletes.
-    1. Load v1 with 3 records.
-    2. Load v2 where one record is removed, one is updated, and one is new.
-    3. Assert that the removed record is marked as is_deleted=True.
-    4. Assert that the updated record is updated and is_deleted=False.
-    5. Assert that the new record is inserted and is_deleted=False.
-    6. Assert that the metadata log shows the correct obsolete_count.
-    """
-    # --- 1. Define Schemas and Data for two ChEMBL versions ---
-    v1_version = "100"
-    v2_version = "101"
-    output_dir = tmp_path / "chembl_data"
-    output_dir.mkdir(exist_ok=True)
-
-    # Version 1: Aspirin, Ibuprofen, Paracetamol
-    v1_sql = """
-    CREATE TABLE molecule_dictionary (molregno integer, pref_name text, chembl_id text);
-    ALTER TABLE ONLY molecule_dictionary ADD CONSTRAINT molecule_dictionary_pkey PRIMARY KEY (molregno);
-    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN', 'CHEMBL1');
-    INSERT INTO molecule_dictionary VALUES (2, 'IBUPROFEN', 'CHEMBL2');
-    INSERT INTO molecule_dictionary VALUES (3, 'PARACETAMOL', 'CHEMBL3');
-    """
-    # Version 2: Aspirin (updated), Paracetamol (same), Celecoxib (new). Ibuprofen is now obsolete.
-    v2_sql = """
-    CREATE TABLE molecule_dictionary (molregno integer, pref_name text, chembl_id text);
-    ALTER TABLE ONLY molecule_dictionary ADD CONSTRAINT molecule_dictionary_pkey PRIMARY KEY (molregno);
-    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN V2', 'CHEMBL1'); -- Update
-    INSERT INTO molecule_dictionary VALUES (3, 'PARACETAMOL', 'CHEMBL3'); -- No change
-    INSERT INTO molecule_dictionary VALUES (4, 'CELECOXIB', 'CHEMBL4'); -- Insert
-    """
-    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
-    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
-
-    # --- 2. Setup Mocks ---
-    def setup_mocks(version, gzipped_content):
-        dump_filename = f"chembl_{version}_postgresql.sql.gz"
-        dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/{dump_filename}"
-        checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/checksums.txt"
-        checksum = hashlib.md5(gzipped_content).hexdigest()
-        requests_mock.get(dump_url, content=gzipped_content)
-        requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
-
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
-    setup_mocks(v1_version, v1_gzipped_content)
-    setup_mocks(v2_version, v2_gzipped_content)
-
-    # --- 3. Run FULL load for v1 ---
-    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
-    _create_database(postgres_service)
-
-    # We must trick the pipeline to use .sql.gz for a FULL load for this test
-    original_acquire_data = LoaderPipeline._acquire_data
-    def mock_acquire_data(self):
-        original_mode = self.mode
-        self.chembl_version = int(self.version_str)
-        self.mode = 'DELTA'
-        original_acquire_data(self)
-        self.mode = original_mode
-    LoaderPipeline._acquire_data = mock_acquire_data
-
-    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
-    pipeline_v1.run()
-    LoaderPipeline._acquire_data = original_acquire_data # Restore
-
-    # --- 4. Run DELTA load for v2 ---
-    pipeline_v2 = LoaderPipeline(version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA")
-    pipeline_v2.run()
-
-    # --- 5. Assert final state ---
-    conn = psycopg2.connect(postgres_service["uri"])
-    try:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT pref_name, is_deleted FROM molecule_dictionary ORDER BY molregno;")
-            results = cursor.fetchall()
-
-            # Expected: (Aspirin V2, False), (Ibuprofen, True), (Paracetamol, False), (Celecoxib, False)
-            assert len(results) == 4
-
-            # molregno=1 (Updated)
-            assert results[0][0] == 'ASPIRIN V2'
-            assert results[0][1] is False
-            # molregno=2 (Obsolete)
-            assert results[1][0] == 'IBUPROFEN'
-            assert results[1][1] is True
-            # molregno=3 (Unchanged)
-            assert results[2][0] == 'PARACETAMOL'
-            assert results[2][1] is False
-            # molregno=4 (Inserted)
-            assert results[3][0] == 'CELECOXIB'
-            assert results[3][1] is False
-
-            # Assert metadata log
-            cursor.execute("""
-                SELECT insert_count, update_count, obsolete_count
-                FROM chembl_loader_meta.load_details
-                WHERE load_id = %s AND table_name = 'molecule_dictionary';
-            """, (pipeline_v2.load_id,))
-            insert_count, update_count, obsolete_count = cursor.fetchone()
-            assert insert_count == 1  # Celecoxib
-            assert update_count == 2  # Aspirin (name changed) and Paracetamol (re-affirmed)
-            assert obsolete_count == 1 # Ibuprofen
-    finally:
-        conn.close()
-
-
 def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock):
     """
     Tests that a DELTA load with `include_tables` only affects the specified tables.
@@ -650,6 +543,104 @@ def test_full_load_standard_representation_mocked(mock_subprocess_run, postgres_
     assert len(table_flag_indices) == len(STANDARD_TABLE_SUBSET)
     for i in table_flag_indices:
         assert call_args[i+1] in STANDARD_TABLE_SUBSET
+
+
+def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, requests_mock):
+    """
+    Tests that the delta load correctly handles obsolete records according to the FRD.
+    It should update the 'status' field in the 'chembl_id_lookup' table.
+    """
+    # --- 1. Define Schemas and Data for two ChEMBL versions ---
+    v1_version = "110"
+    v2_version = "111"
+    output_dir = tmp_path / "chembl_data"
+    output_dir.mkdir(exist_ok=True)
+
+    # Version 1: Contains an ACTIVE drug (CHEMBL1) and another entity (CHEMBL2)
+    v1_sql = """
+    CREATE TABLE chembl_id_lookup (chembl_id text, entity_type text, status text);
+    ALTER TABLE ONLY chembl_id_lookup ADD CONSTRAINT chembl_id_lookup_pkey PRIMARY KEY (chembl_id);
+    INSERT INTO chembl_id_lookup VALUES ('CHEMBL1', 'COMPOUND', 'ACTIVE');
+    INSERT INTO chembl_id_lookup VALUES ('CHEMBL2', 'ASSAY', 'ACTIVE');
+    """
+    # Version 2: CHEMBL1 is now OBSOLETE, CHEMBL2 is unchanged, and a new compound is added.
+    v2_sql = """
+    CREATE TABLE chembl_id_lookup (chembl_id text, entity_type text, status text);
+    ALTER TABLE ONLY chembl_id_lookup ADD CONSTRAINT chembl_id_lookup_pkey PRIMARY KEY (chembl_id);
+    INSERT INTO chembl_id_lookup VALUES ('CHEMBL1', 'COMPOUND', 'OBSOLETE'); -- Status changed
+    INSERT INTO chembl_id_lookup VALUES ('CHEMBL2', 'ASSAY', 'ACTIVE');     -- Unchanged
+    INSERT INTO chembl_id_lookup VALUES ('CHEMBL3', 'COMPOUND', 'ACTIVE'); -- New
+    """
+    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
+    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
+
+    # --- 2. Setup Mocks ---
+    def setup_mocks(version, gzipped_content):
+        dump_filename = f"chembl_{version}_postgresql.sql.gz"
+        dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/{dump_filename}"
+        checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/checksums.txt"
+        checksum = hashlib.md5(gzipped_content).hexdigest()
+        requests_mock.get(dump_url, content=gzipped_content)
+        requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
+
+    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
+    setup_mocks(v1_version, v1_gzipped_content)
+    setup_mocks(v2_version, v2_gzipped_content)
+
+    # --- 3. Run FULL load for v1 ---
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+    _create_database(postgres_service)
+    # Trick pipeline to use .sql.gz for FULL load
+    original_acquire_data = LoaderPipeline._acquire_data
+    def mock_acquire_data(self):
+        original_mode = self.mode
+        self.chembl_version = int(self.version_str)
+        self.mode = 'DELTA'
+        original_acquire_data(self)
+        self.mode = original_mode
+    LoaderPipeline._acquire_data = mock_acquire_data
+    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
+    pipeline_v1.run()
+    LoaderPipeline._acquire_data = original_acquire_data # Restore
+
+    # --- 4. Run DELTA load for v2 ---
+    pipeline_v2 = LoaderPipeline(version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA")
+    pipeline_v2.run()
+
+    # --- 5. Assert final state ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    try:
+        with conn.cursor() as cursor:
+            # Check the statuses in the final table
+            cursor.execute("SELECT chembl_id, status FROM chembl_id_lookup ORDER BY chembl_id;")
+            results = dict(cursor.fetchall())
+
+            assert len(results) == 3
+            assert results['CHEMBL1'] == 'OBSOLETE' # Correctly updated
+            assert results['CHEMBL2'] == 'ACTIVE'   # Unchanged
+            assert results['CHEMBL3'] == 'ACTIVE'   # Correctly inserted
+
+            # Assert that no 'is_deleted' column was ever created
+            cursor.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema = 'public'
+                AND table_name = 'chembl_id_lookup'
+                AND column_name = 'is_deleted';
+            """)
+            assert cursor.fetchone() is None, "'is_deleted' column should not exist."
+
+            # Assert metadata log for the delta load
+            cursor.execute("""
+                SELECT insert_count, update_count, obsolete_count
+                FROM chembl_loader_meta.load_details
+                WHERE load_id = %s AND table_name = 'chembl_id_lookup';
+            """, (pipeline_v2.load_id,))
+            insert_count, update_count, obsolete_count = cursor.fetchone()
+            assert insert_count == 1  # CHEMBL3
+            assert update_count == 1  # CHEMBL2 was reaffirmed, CHEMBL1 was updated by the merge itself
+            assert obsolete_count == 1  # The handle_obsolete_records step should log one change
+    finally:
+        conn.close()
 
 
 def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock, caplog):

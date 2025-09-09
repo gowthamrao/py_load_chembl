@@ -149,9 +149,6 @@ class PostgresAdapter(DatabaseAdapter):
             update_clause = "NOTHING"
         else:
             update_set_clause = ", ".join(f'"{col}" = EXCLUDED."{col}"' for col in non_pk_columns)
-            # Always reset the is_deleted flag on update, as the record is clearly active.
-            if 'is_deleted' in target_cols:
-                update_set_clause += ", is_deleted = FALSE"
             update_clause = f"UPDATE SET {update_set_clause}"
 
         conflict_target = ", ".join(f'"{pk}"' for pk in primary_keys)
@@ -179,42 +176,46 @@ class PostgresAdapter(DatabaseAdapter):
         logger.info(f"Merge complete. Inserted: {inserted_count}, Updated: {updated_count}")
         return {"inserted": inserted_count, "updated": updated_count}
 
-    def soft_delete_obsolete_records(self, source_table: str, target_table: str, primary_keys: List[str]) -> int:
+    def handle_obsolete_records(self, source_schema: str, target_schema: str) -> int:
         """
-        Marks records in the target table as deleted if they do not exist in the source table.
-        This is the "soft delete" operation.
-        Returns:
-            The number of records marked as obsolete.
+        Handles obsolete records based on the chembl_id_lookup table by updating
+        the status of entities that are no longer 'ACTIVE'. ChEMBL marks obsolete
+        records by changing their status.
         """
-        logger.info(f"Marking obsolete records in '{target_table}'...")
-        pk_join_clause = " AND ".join(f't."{pk}" = s."{pk}"' for pk in primary_keys)
+        source_table = f'"{source_schema}"."chembl_id_lookup"'
+        target_table = f'"{target_schema}"."chembl_id_lookup"'
+        logger.info(f"Identifying and updating obsolete entities from '{source_table}' in '{target_table}'...")
 
-        # We use a LEFT JOIN from target to source. If a source record is NULL,
-        # it means the target record is obsolete.
-        # We only update records that are not already marked as deleted.
+        # We find records in the target table that are currently ACTIVE,
+        # but in the new source data, they are either NOT ACTIVE or do not exist anymore.
+        # ChEMBL might remove entries or explicitly mark them as 'OBSOLETE'.
         sql = f"""
-        WITH obsolete_rows AS (
-            SELECT t.ctid
-            FROM {target_table} t
-            LEFT JOIN {source_table} s ON {pk_join_clause}
-            WHERE s."{primary_keys[0]}" IS NULL AND t.is_deleted = FALSE
+        WITH updated_statuses AS (
+            UPDATE {target_table} t
+            SET status = s.status
+            FROM {source_table} s
+            WHERE t.chembl_id = s.chembl_id AND t.status = 'ACTIVE' AND s.status != 'ACTIVE'
+            RETURNING t.chembl_id
         )
-        UPDATE {target_table}
-        SET is_deleted = TRUE
-        WHERE ctid IN (SELECT ctid FROM obsolete_rows)
-        RETURNING 1;
+        SELECT COUNT(*) FROM updated_statuses;
         """
 
-        # We use RETURNING to count the number of updated rows
-        results = self.execute_sql(sql, fetch='all')
-        obsolete_count = len(results)
+        try:
+            result = self.execute_sql(sql, fetch='one')
+            obsolete_count = result[0] if result else 0
 
-        if obsolete_count > 0:
-            logger.info(f"Marked {obsolete_count} records as obsolete in '{target_table}'.")
-        else:
-            logger.info(f"No records needed to be marked as obsolete in '{target_table}'.")
+            if obsolete_count > 0:
+                logger.info(f"Updated {obsolete_count} entities to non-ACTIVE status in '{target_table}'.")
+            else:
+                logger.info(f"No active entities became obsolete in this update.")
 
-        return obsolete_count
+            return obsolete_count
+        except psycopg2.Error as e:
+            # This can happen if chembl_id_lookup table doesn't exist, which is fine on first load
+            if "does not exist" in str(e):
+                logger.warning("chembl_id_lookup not found. Skipping obsolete record handling.")
+                return 0
+            raise e
 
     def optimize_pre_load(self, schema: str) -> None:
         """
@@ -327,64 +328,22 @@ class PostgresAdapter(DatabaseAdapter):
         results = self.execute_sql(sql, (schema, table_name), fetch='all')
         return [row[0] for row in results]
 
-    def migrate_schema(self, source_schema: str, source_table_name: str, target_schema: str, target_table_name: str):
+    def get_column_definitions(self, schema: str, table_name: str) -> List[Dict[str, Any]]:
         """
-        Compares the schema of a source and target table. If the target table does not exist,
-        it is created. If it exists, additive changes (new columns) are applied.
+        Retrieves the column definitions for a given table for PostgreSQL.
         """
-        logger.info(f"Comparing schema for table '{target_table_name}'...")
-
-        # Check if target table exists
-        table_exists_sql = "SELECT to_regclass(%s);"
-        target_table_regclass = f'"{target_schema}"."{target_table_name}"'
-        result = self.execute_sql(table_exists_sql, (target_table_regclass,), fetch='one')
-
-        if result[0] is None:
-            # Target table does not exist, so create it based on the source table's structure
-            logger.info(f"Target table '{target_table_regclass}' does not exist. Creating it now.")
-            create_sql = f'CREATE TABLE {target_table_regclass} (LIKE "{source_schema}"."{source_table_name}" INCLUDING ALL);'
-            self.execute_sql(create_sql)
-            # Also add the is_deleted column for soft-delete tracking
-            add_col_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;'
-            self.execute_sql(add_col_sql)
-            logger.info(f"Table '{target_table_regclass}' created and prepared for loading.")
-            return  # No further migration needed
-
-        # --- If table exists, proceed with column comparison ---
-        source_cols_sql = "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
-        source_cols_result = self.execute_sql(source_cols_sql, (source_schema, source_table_name), fetch='all')
-        source_columns = {row[0]: {'type': row[1], 'length': row[2]} for row in source_cols_result}
-
-        target_cols_sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
-        target_cols_result = self.execute_sql(target_cols_sql, (target_schema, target_table_name), fetch='all')
-        target_columns = {row[0] for row in target_cols_result}
-
-        # Ensure the is_deleted column exists for soft deletes
-        if 'is_deleted' not in target_columns:
-            logger.info(f"Adding 'is_deleted' column to target table '{target_table_name}' for soft-delete tracking.")
-            add_col_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT FALSE;'
-            self.execute_sql(add_col_sql)
-            target_columns.add('is_deleted')
-
-        new_columns = source_columns.keys() - target_columns
-
-        if not new_columns:
-            logger.info("Schemas are identical. No migration needed.")
-            return
-
-        logger.info(f"Found new columns to add: {', '.join(new_columns)}")
-
-        for col_name in sorted(list(new_columns)):
-            col_info = source_columns[col_name]
-            data_type = col_info['type']
-            if col_info['length']:
-                data_type = f"{data_type}({col_info['length']})"
-
-            alter_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN "{col_name}" {data_type};'
-            logger.info(f"Applying schema change: {alter_sql}")
-            self.execute_sql(alter_sql)
-
-        logger.info(f"Successfully migrated schema for table '{target_table_name}'.")
+        logger.debug(f"Fetching column definitions for '{schema}.{table_name}'...")
+        sql = """
+            SELECT column_name, data_type, character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema = %s AND table_name = %s
+            ORDER BY ordinal_position;
+        """
+        results = self.execute_sql(sql, (schema, table_name), fetch='all')
+        return [
+            {'name': row[0], 'type': row[1], 'length': row[2]}
+            for row in results
+        ]
 
     def _run_psql_restore(self, dump_archive_path: Path, schema: str):
         """
