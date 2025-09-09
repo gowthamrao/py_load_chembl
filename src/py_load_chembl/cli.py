@@ -1,11 +1,14 @@
 import typer
 from pathlib import Path
 from typing_extensions import Annotated
+import logging
+from py_load_chembl.logging_config import setup_logging
 
 from py_load_chembl.adapters.postgres import PostgresAdapter
 from py_load_chembl.pipeline import LoaderPipeline
 
 app = typer.Typer(rich_markup_mode="rich")
+logger = logging.getLogger(__name__)
 
 # Reusable options for commands
 VersionOption = Annotated[
@@ -52,14 +55,12 @@ def load(
     """
     Downloads and loads ChEMBL data into a target database.
     """
-    typer.echo(f"Initiating ChEMBL load...")
-    typer.echo(f"  Target: {target}")
-    typer.echo(f"  Mode: {mode}")
-    typer.echo(f"  Version: {version}")
+    setup_logging()
+    logger.info("Initiating ChEMBL load", extra={"target": target, "mode": mode, "version": version})
 
     # For now, we only support postgres
     if not target.startswith("postgresql"):
-        typer.echo(f"Error: Only postgresql targets are currently supported.", err=True)
+        logger.critical("Only postgresql targets are currently supported.", extra={"target": target})
         raise typer.Exit(code=1)
 
     adapter = PostgresAdapter(connection_string=target)
@@ -69,7 +70,7 @@ def load(
         pipeline.run()
         typer.echo("\n[bold green]ChEMBL load process completed successfully![/bold green]")
     except (ConnectionError, ValueError, RuntimeError) as e:
-        typer.echo(f"\n[bold red]An error occurred:[/bold red] {e}", err=True)
+        logger.critical(f"A critical error occurred during the load process: {e}", exc_info=True)
         raise typer.Exit(code=1)
 
 
@@ -81,9 +82,8 @@ def download(
     """
     Downloads ChEMBL data files without loading them into a database.
     """
-    typer.echo(f"Initiating ChEMBL download only...")
-    typer.echo(f"  Version: {version}")
-    typer.echo(f"  Output Directory: {output_dir}")
+    setup_logging()
+    logger.info("Initiating ChEMBL download only", extra={"version": version, "output_dir": str(output_dir)})
 
     # No adapter or mode is needed for download-only
     pipeline = LoaderPipeline(version=version, output_dir=output_dir)
@@ -94,7 +94,7 @@ def download(
         pipeline._acquire_data()
         typer.echo("\n[bold green]ChEMBL download process completed successfully![/bold green]")
     except (ConnectionError, ValueError) as e:
-        typer.echo(f"\n[bold red]An error occurred:[/bold red] {e}", err=True)
+        logger.critical(f"A critical error occurred during the download process: {e}", exc_info=True)
         raise typer.Exit(code=1)
 
 

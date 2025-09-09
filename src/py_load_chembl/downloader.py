@@ -1,5 +1,6 @@
 import hashlib
 import re
+import logging
 from pathlib import Path
 from typing import List, Tuple
 
@@ -13,6 +14,7 @@ from rich.progress import (
     TransferSpeedColumn,
 )
 
+logger = logging.getLogger(__name__)
 BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases"
 
 
@@ -20,6 +22,7 @@ def get_latest_chembl_version() -> int:
     """
     Finds the latest ChEMBL version number from the EBI FTP server.
     """
+    logger.info(f"Querying EBI FTP server for latest ChEMBL version at: {BASE_URL}")
     try:
         response = requests.get(BASE_URL + "/", timeout=30)
         response.raise_for_status()
@@ -31,7 +34,9 @@ def get_latest_chembl_version() -> int:
     if not dir_names:
         raise ValueError("Could not find any ChEMBL versions in the FTP directory.")
 
-    return max(int(v) for v in dir_names)
+    latest_version = max(int(v) for v in dir_names)
+    logger.info(f"Detected latest ChEMBL version: {latest_version}")
+    return latest_version
 
 
 def get_chembl_file_urls(version: int, plain_sql: bool = True) -> Tuple[str, str]:
@@ -70,6 +75,9 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
         initial_size = local_path.stat().st_size
         headers["Range"] = f"bytes={initial_size}-"
         file_mode = "ab"
+        logger.info(f"Resuming download for {local_filename} from {initial_size} bytes.")
+    else:
+        logger.info(f"Starting new download for {local_filename}.")
 
     try:
         with requests.get(url, stream=True, headers=headers, timeout=60) as r:
@@ -95,6 +103,7 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
     except requests.RequestException as e:
         raise ConnectionError(f"Failed to download {url}: {e}") from e
 
+    logger.info(f"Finished downloading {local_filename}.")
     return local_path
 
 
@@ -102,6 +111,7 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
     """
     Verifies the MD5 checksum of a downloaded file.
     """
+    logger.info(f"Verifying checksum for {file_path.name} using checksums from {checksums_url}")
     try:
         response = requests.get(checksums_url, timeout=30)
         response.raise_for_status()
@@ -126,4 +136,10 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
             hasher.update(chunk)
     actual_checksum = hasher.hexdigest()
 
-    return actual_checksum == expected_checksum
+    is_valid = actual_checksum == expected_checksum
+    if is_valid:
+        logger.info("Checksum valid.", extra={"file": file_path.name, "expected": expected_checksum, "actual": actual_checksum})
+    else:
+        logger.warning("Checksum invalid.", extra={"file": file_path.name, "expected": expected_checksum, "actual": actual_checksum})
+
+    return is_valid

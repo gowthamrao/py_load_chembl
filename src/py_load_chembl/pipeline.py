@@ -1,9 +1,12 @@
 import datetime
+import logging
 from pathlib import Path
 from py_load_chembl import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
 from py_load_chembl.schema_parser import parse_chembl_ddl
+
+logger = logging.getLogger(__name__)
 
 
 class LoaderPipeline:
@@ -30,16 +33,16 @@ class LoaderPipeline:
         """
         Executes the loading pipeline.
         """
-        print(f"Starting ChEMBL load for version '{self.version_str}' in {self.mode} mode.")
+        logger.info(f"Starting ChEMBL load for version '{self.version_str}' in {self.mode} mode.")
         error = None
         try:
-            self._setup_logging()
+            self._log_start_to_db()
 
             # 1. Acquisition Stage
             self._acquire_data()
 
             if self.pg_dump_path:
-                print(f"Successfully downloaded and verified ChEMBL {self.chembl_version} to {self.pg_dump_path}")
+                logger.info(f"Successfully downloaded and verified ChEMBL {self.chembl_version} to {self.pg_dump_path}")
             else:
                 raise RuntimeError("Data acquisition failed to return a valid file path.")
 
@@ -53,18 +56,19 @@ class LoaderPipeline:
 
         except Exception as e:
             error = e
-            # Re-raise the exception after logging
+            # Re-raise the exception to be handled by the CLI
             raise
         finally:
-            self._finalize_logging(error)
+            # Always ensure the database log is finalized
+            self._log_end_to_db(error)
 
     def _acquire_data(self):
         """Handles the data acquisition stage of the pipeline."""
-        print("\n--- Stage: Acquisition ---")
+        logger.info("--- Stage: Acquisition ---")
         if self.version_str.lower() == "latest":
-            print("Detecting latest ChEMBL version...")
+            logger.info("Detecting latest ChEMBL version...")
             self.chembl_version = downloader.get_latest_chembl_version()
-            print(f"Latest version is: {self.chembl_version}")
+            logger.info(f"Latest version is: {self.chembl_version}")
         else:
             self.chembl_version = int(self.version_str)
 
@@ -73,21 +77,21 @@ class LoaderPipeline:
         use_plain_sql = self.mode == 'DELTA'
         dump_url, checksums_url = downloader.get_chembl_file_urls(self.chembl_version, plain_sql=use_plain_sql)
 
-        print(f"Requesting ChEMBL dump from: {dump_url}")
+        logger.info(f"Requesting ChEMBL dump from: {dump_url}")
         # Check if file already exists and is valid before downloading
         local_file = self.output_dir / dump_url.split("/")[-1]
         if local_file.exists():
-            print(f"File '{local_file.name}' already exists. Verifying checksum...")
+            logger.info(f"File '{local_file.name}' already exists. Verifying checksum...")
             if downloader.verify_checksum(local_file, checksums_url):
-                print("Checksum is valid. Skipping download.")
+                logger.info("Checksum is valid. Skipping download.")
                 self.pg_dump_path = local_file
                 return
             else:
-                print("Checksum is invalid. Re-downloading the file.")
+                logger.warning("Checksum is invalid. Re-downloading the file.")
 
         downloaded_file = downloader.download_file(dump_url, self.output_dir)
 
-        print("Verifying file integrity...")
+        logger.info("Verifying file integrity...")
         is_valid = downloader.verify_checksum(downloaded_file, checksums_url)
 
         if not is_valid:
@@ -97,14 +101,14 @@ class LoaderPipeline:
             )
 
         self.pg_dump_path = downloaded_file
-        print("Checksum verified successfully.")
+        logger.info("Checksum verified successfully.")
 
     def _execute_full_load(self):
         """Handles the full data load stage."""
-        if not self.adapter:
+        if not self.adapter or not self.pg_dump_path:
             raise RuntimeError("An adapter must be configured to execute a full load.")
 
-        print("\n--- Stage: Full Load ---")
+        logger.info("--- Stage: Full Load ---")
 
         # Clean the public schema to ensure idempotency. This drops all existing tables.
         self.adapter.clean_schema("public")
@@ -116,10 +120,10 @@ class LoaderPipeline:
             data_source=self.pg_dump_path,
             schema="public",  # Explicitly restore to public schema
         )
-        self._log_load_details(table_name="all_tables_via_pg_restore", insert_count=-1)
+        self._log_load_details_to_db(table_name="all_tables_via_pg_restore", insert_count=-1)
 
         # 3. Post-Processing Stage
-        print("\n--- Stage: Post-Processing ---")
+        logger.info("--- Stage: Post-Processing ---")
         self.adapter.optimize_post_load(schema="public") # Schema is illustrative
 
     def _execute_delta_load(self):
@@ -130,32 +134,31 @@ class LoaderPipeline:
         if not self.adapter or not self.pg_dump_path:
             raise RuntimeError("An adapter and data path must be configured for a delta load.")
 
-        print("\n--- Stage: Delta Load ---")
+        logger.info("--- Stage: Delta Load ---")
         staging_schema = f"staging_chembl_{self.chembl_version}"
         target_schema = "public"
 
         try:
             # 1. Load new data into a temporary staging schema
-            print(f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'...")
+            logger.info(f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'...")
             # Note: The .sql.gz dump is required for delta mode.
             self.adapter.bulk_load_table(
                 table_name="all",
                 data_source=self.pg_dump_path,
                 schema=staging_schema,
             )
-            print("Staging load complete.")
+            logger.info("Staging load complete.")
 
             # 2. Dynamically parse the DDL to get primary key information.
-            # This makes the process robust and independent of a static, manually maintained file.
             chembl_schemas = parse_chembl_ddl(self.pg_dump_path)
 
             # 3. Get the list of tables to merge from the staging schema
             tables_to_merge = self.adapter.get_table_names(schema=staging_schema)
-            print(f"Found {len(tables_to_merge)} tables in staging schema to process.")
+            logger.info(f"Found {len(tables_to_merge)} tables in staging schema to process.")
 
             # 4. Iterate and merge each table
             for table_name in tables_to_merge:
-                print(f"\n--- Processing table: {table_name} ---")
+                logger.info(f"--- Processing table: {table_name} ---")
 
                 # 4a. Compare schemas and migrate if necessary before merging
                 self.adapter.migrate_schema(
@@ -168,13 +171,13 @@ class LoaderPipeline:
                 # 4b. Get primary key info from our dynamically parsed schema
                 table_schema_info = chembl_schemas.get(table_name)
                 if not table_schema_info or not table_schema_info.primary_keys:
-                    print(f"Warning: No primary key definition found for table '{table_name}'. Skipping merge.")
+                    logger.warning(f"No primary key definition found for table '{table_name}'. Skipping merge.")
                     continue
 
                 # 4c. Introspect the staging table to get all column names for the merge
                 all_columns = self.adapter.get_column_names(schema=staging_schema, table_name=table_name)
                 if not all_columns:
-                    print(f"Warning: Could not find columns for table '{table_name}'. Skipping merge.")
+                    logger.warning(f"Could not find columns for table '{table_name}'. Skipping merge.")
                     continue
 
                 # 4d. Perform the merge from staging to production
@@ -185,7 +188,7 @@ class LoaderPipeline:
                     all_columns=all_columns,
                 )
 
-                self._log_load_details(
+                self._log_load_details_to_db(
                     table_name=table_name,
                     insert_count=merge_stats.get("inserted", 0),
                     update_count=merge_stats.get("updated", 0),
@@ -193,12 +196,12 @@ class LoaderPipeline:
 
         finally:
             # 5. Clean up by dropping the staging schema
-            print(f"\nCleaning up temporary staging schema '{staging_schema}'...")
+            logger.info(f"Cleaning up temporary staging schema '{staging_schema}'...")
             self.adapter.execute_sql(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
-            print("Cleanup complete.")
+            logger.info("Cleanup complete.")
 
-    def _setup_logging(self):
-        """Initializes metadata tables and logs the start of the process."""
+    def _log_start_to_db(self):
+        """Initializes metadata tables and logs the start of the process to the database."""
         if not self.adapter:
             return
         self.adapter.create_metadata_tables()
@@ -217,17 +220,17 @@ class LoaderPipeline:
         )
         result = self.adapter.execute_sql(sql, params, fetch='one')
         self.load_id = result[0]
-        print(f"Logging to load_id: {self.load_id}")
+        logger.info(f"Logging to database with load_id: {self.load_id}")
 
-    def _finalize_logging(self, error: Exception | None):
-        """Updates the metadata log with the final status of the load."""
+    def _log_end_to_db(self, error: Exception | None):
+        """Updates the metadata log in the database with the final status of the load."""
         if not self.adapter or not self.load_id:
             return
 
         status = 'FAILED' if error else 'SUCCESS'
         error_message = str(error) if error else None
 
-        print(f"Finalizing load_id {self.load_id} with status: {status}")
+        logger.info(f"Finalizing load_id {self.load_id} in database with status: {status}")
 
         sql = """
             UPDATE chembl_loader_meta.load_history
@@ -242,8 +245,8 @@ class LoaderPipeline:
         )
         self.adapter.execute_sql(sql, params)
 
-    def _log_load_details(self, table_name: str, stage_record_count: int = 0, insert_count: int = 0, update_count: int = 0, obsolete_count: int = 0):
-        """Logs the details for a specific table load."""
+    def _log_load_details_to_db(self, table_name: str, stage_record_count: int = 0, insert_count: int = 0, update_count: int = 0, obsolete_count: int = 0):
+        """Logs the details for a specific table load to the database."""
         if not self.adapter or not self.load_id:
             return
 
