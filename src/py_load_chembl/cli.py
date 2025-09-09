@@ -1,9 +1,11 @@
 import typer
 from pathlib import Path
+from typing import Optional
 from typing_extensions import Annotated
 import logging
 from py_load_chembl.logging_config import setup_logging
 from py_load_chembl import api, downloader
+from py_load_chembl.config import STANDARD_PROFILE_TABLES
 
 app = typer.Typer(rich_markup_mode="rich")
 logger = logging.getLogger(__name__)
@@ -50,17 +52,37 @@ def load(
     version: VersionOption = "latest",
     output_dir: OutputDirOption = Path("./chembl_data"),
     include_tables: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--include-tables",
-            help="Comma-separated list of tables to load (e.g., 'molecule_dictionary,compound_structures'). If not provided, all tables are loaded.",
+            help="Comma-separated list of tables to load (e.g., 'molecule_dictionary,compound_structures'). Mutually exclusive with --profile.",
+        ),
+    ] = None,
+    profile: Annotated[
+        Optional[str],
+        typer.Option(
+            "--profile",
+            help="Use a predefined profile of tables to load. Currently only 'standard' is available. Mutually exclusive with --include-tables.",
         ),
     ] = None,
 ):
     """
     Downloads and loads ChEMBL data into a target database.
     """
-    table_list = include_tables.split(",") if include_tables else None
+    table_list = None
+    if profile and include_tables:
+        logger.critical("--profile and --include-tables are mutually exclusive.")
+        raise typer.Exit(code=1)
+
+    if profile:
+        if profile.lower() == "standard":
+            table_list = STANDARD_PROFILE_TABLES
+            logger.info(f"Using 'standard' profile, which includes {len(table_list)} tables.")
+        else:
+            logger.critical(f"Invalid profile '{profile}'. Only 'standard' is available.")
+            raise typer.Exit(code=1)
+    elif include_tables:
+        table_list = include_tables.split(",")
 
     try:
         if mode.upper() == 'FULL':
