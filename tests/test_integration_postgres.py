@@ -7,8 +7,10 @@ import tempfile
 import tarfile
 from pathlib import Path
 import requests_mock
+import io
 import json
 import logging
+from unittest.mock import patch
 
 from py_load_chembl.pipeline import LoaderPipeline
 from py_load_chembl.adapters.postgres import PostgresAdapter
@@ -595,15 +597,72 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
         conn.close()
 
 
-def test_full_load_with_table_subset(postgres_service, tmp_path, requests_mock):
+@patch("subprocess.run")
+def test_full_load_with_table_subset(mock_subprocess_run, postgres_service, tmp_path, requests_mock):
     """
-    Tests that a FULL load with the `include_tables` option only loads the
-    specified tables.
+    Tests that a FULL load with the `include_tables` option correctly calls
+    pg_restore with the appropriate --table arguments.
+    """
+    # --- 1. Setup mocks and test data ---
+    chembl_version = "99"
+    tables_to_load = ["molecule_dictionary", "compound_structures"]
+    output_dir = tmp_path / "chembl_data"
 
-    TODO: This test requires creating a valid pg_restore archive, which is complex.
-    A unit test mocking subprocess.run is a better approach.
-    """
-    pass
+    # The full load requires a .tar.gz file containing a directory. We create a
+    # valid, gzipped tar archive in-memory with an empty directory to satisfy
+    # the adapter's extraction and path-finding logic.
+    tar_gz_filename = f"chembl_{chembl_version}_postgresql.tar.gz"
+    tar_gz_buffer = io.BytesIO()
+    with tarfile.open(fileobj=tar_gz_buffer, mode="w:gz") as tar:
+        # Add an empty directory, which is what the adapter expects to find.
+        dir_info = tarfile.TarInfo(name=f"chembl_{chembl_version}_postgresql")
+        dir_info.type = tarfile.DIRTYPE
+        tar.addfile(dir_info)
+    tar_gz_content = tar_gz_buffer.getvalue()
+
+    tar_gz_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/{tar_gz_filename}"
+    checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/checksums.txt"
+
+    # Mock the download of the dummy tarball and its checksum
+    checksum = hashlib.md5(tar_gz_content).hexdigest()
+    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{chembl_version}/"></a>')
+    requests_mock.get(tar_gz_url, content=tar_gz_content)
+    requests_mock.get(checksum_url, text=f"{checksum}  {tar_gz_filename}")
+
+    # Mock the return value of subprocess.run to prevent it from actually running
+    mock_subprocess_run.return_value.returncode = 0
+
+    # --- 2. Configure and run the pipeline ---
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+    _create_database(postgres_service)
+    pipeline = LoaderPipeline(
+        adapter=adapter,
+        version=chembl_version,
+        mode="FULL",
+        output_dir=output_dir,
+        include_tables=tables_to_load,
+    )
+    pipeline.run()
+
+    # --- 3. Assert that pg_restore was called with the correct arguments ---
+    mock_subprocess_run.assert_called_once()
+    call_args = mock_subprocess_run.call_args[0][0] # Get the list of command arguments
+
+    # Check for the pg_restore command
+    assert "pg_restore" in call_args
+
+    # Check that a --table flag was included for each table
+    assert "--table" in call_args
+    assert "molecule_dictionary" in call_args
+    assert "compound_structures" in call_args
+
+    # More robustly, check the count of --table flags
+    table_flag_indices = [i for i, arg in enumerate(call_args) if arg == "--table"]
+    assert len(table_flag_indices) == len(tables_to_load)
+
+    # Check that the table names correctly follow the flags
+    for i in table_flag_indices:
+        assert call_args[i+1] in tables_to_load
 
 
 def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock, caplog):
