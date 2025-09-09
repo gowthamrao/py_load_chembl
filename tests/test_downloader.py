@@ -23,22 +23,22 @@ def test_get_latest_chembl_version(requests_mock):
 
 def test_get_chembl_file_urls():
     """Test that the file URLs are constructed correctly for both dump formats."""
-    # Test the new default behavior (plain SQL dump)
-    sql_url, checksums_url_1 = downloader.get_chembl_file_urls(34)
+    # Test the default behavior (pg_restore dump, i.e., plain_sql=False)
+    tar_url, checksums_url_1 = downloader.get_chembl_file_urls(34)
     assert (
-        sql_url
-        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.sql.gz"
+        tar_url
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.tar.gz"
     )
     assert (
         checksums_url_1
         == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/checksums.txt"
     )
 
-    # Test the old behavior (pg_restore dump)
-    tar_url, checksums_url_2 = downloader.get_chembl_file_urls(34, plain_sql=False)
+    # Test the plain SQL dump behavior
+    sql_url, checksums_url_2 = downloader.get_chembl_file_urls(34, plain_sql=True)
     assert (
-        tar_url
-        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.tar.gz"
+        sql_url
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.sql.gz"
     )
     assert (
         checksums_url_2

@@ -122,21 +122,16 @@ def download(
             chembl_version = int(version)
 
         # We download the .tar.gz by default as it's the most common use case (full load)
-        dump_url, checksum_url = downloader.get_chembl_file_urls(
-            chembl_version, plain_sql=False
+        downloaded_file = downloader.download_chembl_db(
+            chembl_version, output_dir, plain_sql=False
         )
-
-        downloaded_file = downloader.download_file(dump_url, output_dir)
-        is_valid = downloader.verify_checksum(downloaded_file, checksum_url)
-        if not is_valid:
-            raise ValueError("Downloaded file failed checksum verification.")
 
         typer.echo(
             f"\n[bold green]ChEMBL {version} download process completed successfully![/bold green]"
         )
         typer.echo(f"File saved to: {downloaded_file}")
 
-    except (ConnectionError, ValueError) as e:
+    except (ConnectionError, ValueError, downloader.ChecksumError) as e:
         logger.critical(
             f"A critical error occurred during the download process: {e}", exc_info=True
         )
