@@ -49,17 +49,32 @@ export LOG_LEVEL="DEBUG"
 
 A **Full Load** will completely wipe the target schema and load a specific ChEMBL version from scratch. This is for initializing a new database.
 
+By default, a full load will import all ~80 tables from the ChEMBL dump. This is the `full` representation.
+
 ```bash
+# This is equivalent to specifying --representation full
 py-load-chembl load \
     --target "$CHEMBL_DB_TARGET" \
     --mode FULL \
     --version 33
 ```
 
+#### Standard Representation
+
+For many common use cases, only a subset of tables is needed. You can specify the `standard` representation to load only the most essential tables (e.g., `molecule_dictionary`, `activities`, `assays`, `targets`). This is significantly faster and requires less disk space.
+
+```bash
+py-load-chembl load \
+    --target "$CHEMBL_DB_TARGET" \
+    --mode FULL \
+    --version 33 \
+    --representation standard
+```
+
 To load the latest version, use `latest`:
 
 ```bash
-py-load-chembl load --mode FULL --version latest
+py-load-chembl load --mode FULL --version latest --representation standard
 ```
 
 ### Delta Load
