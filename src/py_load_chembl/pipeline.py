@@ -287,11 +287,11 @@ class LoaderPipeline:
             logger.info(
                 f"Target table '{target_schema}.{table_name}' does not exist. Creating it."
             )
-            # This LIKE statement is specific to PostgreSQL but is a reasonable default.
-            # A more advanced implementation might use an abstract method in the adapter.
-            create_sql = f'CREATE TABLE "{target_schema}"."{table_name}" (LIKE "{source_schema}"."{table_name}" INCLUDING ALL);'
-            self.adapter.execute_sql(create_sql)
-            logger.info(f"Table '{target_schema}.{table_name}' created.")
+            self.adapter.create_table_from_schema(
+                source_schema=source_schema,
+                target_schema=target_schema,
+                table_name=table_name,
+            )
             return
 
         # Get column definitions from source and target to find new columns

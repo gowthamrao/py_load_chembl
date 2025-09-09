@@ -10,6 +10,20 @@ class DatabaseAdapter(ABC):
         pass
 
     @abstractmethod
+    def create_table_from_schema(
+        self, source_schema: str, target_schema: str, table_name: str
+    ) -> None:
+        """
+        Creates a new table in the target schema with the same schema as the source table.
+
+        Args:
+            source_schema: The schema of the source table.
+            target_schema: The schema where the new table will be created.
+            table_name: The name of the table to create.
+        """
+        pass
+
+    @abstractmethod
     def execute_ddl(self, ddl_script: str) -> None:
         """Executes a DDL script (e.g., schema creation, index management)."""
         pass

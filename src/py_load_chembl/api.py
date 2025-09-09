@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import List, Optional
 import logging
 
-from py_load_chembl.adapters.postgres import PostgresAdapter
+from py_load_chembl.adapters.factory import get_adapter
 from py_load_chembl.pipeline import LoaderPipeline
 from py_load_chembl.logging_config import setup_logging
 
@@ -28,10 +28,7 @@ def full_load(
     setup_logging()
     logger.info("Starting ChEMBL full load via Python API.")
 
-    if not connection_string.startswith("postgresql"):
-        raise ValueError("Only postgresql targets are currently supported.")
-
-    adapter = PostgresAdapter(connection_string=connection_string)
+    adapter = get_adapter(connection_string)
     pipeline = LoaderPipeline(
         adapter=adapter,
         version=chembl_version,
@@ -64,10 +61,7 @@ def delta_load(
     if chembl_version.lower() == "latest":
         raise ValueError("A specific ChEMBL version must be provided for a delta load.")
 
-    if not connection_string.startswith("postgresql"):
-        raise ValueError("Only postgresql targets are currently supported.")
-
-    adapter = PostgresAdapter(connection_string=connection_string)
+    adapter = get_adapter(connection_string)
     pipeline = LoaderPipeline(
         adapter=adapter,
         version=chembl_version,
