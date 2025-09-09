@@ -183,6 +183,7 @@ class LoaderPipeline:
                 table_name="all",
                 data_source=self.pg_dump_path,
                 schema=staging_schema,
+                options={"unlogged_staging": True},
             )
             logger.info("Staging load complete.")
 

@@ -110,7 +110,10 @@ class PostgresAdapter(DatabaseAdapter):
             logger.info(
                 f"Initiating schema-specific restore from '{data_source_path}' using psql..."
             )
-            self._run_psql_restore(data_source_path, schema=schema)
+            unlogged_staging = options.get("unlogged_staging", False)
+            self._run_psql_restore(
+                data_source_path, schema=schema, unlogged=unlogged_staging
+            )
             logger.info("Schema-specific restore completed.")
         elif data_source_path.name.endswith(".tar.gz"):
             logger.info(
@@ -397,7 +400,9 @@ class PostgresAdapter(DatabaseAdapter):
         results = self.execute_sql(sql, (schema, table_name), fetch="all")
         return [{"name": row[0], "type": row[1], "length": row[2]} for row in results]
 
-    def _run_psql_restore(self, dump_archive_path: Path, schema: str):
+    def _run_psql_restore(
+        self, dump_archive_path: Path, schema: str, unlogged: bool = False
+    ):
         """
         Decompresses a .sql.gz dump and loads it into a specific schema using psql.
         This version redirects stdout/stderr to temp files to avoid I/O deadlocks.
@@ -410,6 +415,9 @@ class PostgresAdapter(DatabaseAdapter):
         logger.info(
             f"Initiating PSQL restore from '{dump_archive_path}' into schema '{schema}'..."
         )
+        if unlogged:
+            logger.info("Staging mode: All tables will be created as UNLOGGED.")
+
         env = os.environ.copy()
         env.update(
             {
@@ -435,6 +443,11 @@ class PostgresAdapter(DatabaseAdapter):
         try:
             with gzip.open(dump_archive_path, "rt", encoding="utf-8") as f:
                 sql_content = f.read()
+
+            if unlogged:
+                # Use simple string replacement. It's fast and the ChEMBL DDL is consistent.
+                # A regex would be overkill and potentially slower.
+                sql_content = sql_content.replace("CREATE TABLE", "CREATE UNLOGGED TABLE")
 
             full_script = f'SET search_path = "{schema}", public;\n{sql_content}'
 
