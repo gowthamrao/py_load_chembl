@@ -72,7 +72,7 @@ class PostgresAdapter(DatabaseAdapter):
         CREATE TABLE IF NOT EXISTS {meta_schema}.load_details (
             detail_id SERIAL PRIMARY KEY,
             load_id INTEGER NOT NULL REFERENCES {meta_schema}.load_history(load_id),
-            table_name VARCHAR(100) NOT NULL,
+            table_name TEXT NOT NULL,
             stage_record_count BIGINT,
             insert_count BIGINT,
             update_count BIGINT,

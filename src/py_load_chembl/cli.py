@@ -5,7 +5,7 @@ from typing_extensions import Annotated
 import logging
 from py_load_chembl.logging_config import setup_logging
 from py_load_chembl import api, downloader
-from py_load_chembl.config import STANDARD_PROFILE_TABLES
+from py_load_chembl.config import Representation, STANDARD_TABLE_SUBSET
 
 app = typer.Typer(rich_markup_mode="rich")
 logger = logging.getLogger(__name__)
@@ -51,38 +51,23 @@ def load(
     ] = "FULL",
     version: VersionOption = "latest",
     output_dir: OutputDirOption = Path("./chembl_data"),
-    include_tables: Annotated[
-        Optional[str],
+    representation: Annotated[
+        Representation,
         typer.Option(
-            "--include-tables",
-            help="Comma-separated list of tables to load (e.g., 'molecule_dictionary,compound_structures'). Mutually exclusive with --profile.",
+            "--representation",
+            "-r",
+            help="Data representation to load: 'full' or 'standard' (subset of tables).",
+            case_sensitive=False,
         ),
-    ] = None,
-    profile: Annotated[
-        Optional[str],
-        typer.Option(
-            "--profile",
-            help="Use a predefined profile of tables to load. Currently only 'standard' is available. Mutually exclusive with --include-tables.",
-        ),
-    ] = None,
+    ] = Representation.FULL,
 ):
     """
     Downloads and loads ChEMBL data into a target database.
     """
     table_list = None
-    if profile and include_tables:
-        logger.critical("--profile and --include-tables are mutually exclusive.")
-        raise typer.Exit(code=1)
-
-    if profile:
-        if profile.lower() == "standard":
-            table_list = STANDARD_PROFILE_TABLES
-            logger.info(f"Using 'standard' profile, which includes {len(table_list)} tables.")
-        else:
-            logger.critical(f"Invalid profile '{profile}'. Only 'standard' is available.")
-            raise typer.Exit(code=1)
-    elif include_tables:
-        table_list = include_tables.split(",")
+    if representation == Representation.STANDARD:
+        table_list = STANDARD_TABLE_SUBSET
+        logger.info(f"Using 'standard' representation, which includes {len(table_list)} tables.")
 
     try:
         if mode.upper() == 'FULL':
