@@ -1,7 +1,7 @@
 import datetime
 import logging
 from pathlib import Path
-from py_load_chembl import __version__
+from py_load_chembl._version import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
 from py_load_chembl.schema_parser import parse_chembl_ddl

@@ -495,6 +495,106 @@ def test_delta_load_with_soft_deletes(postgres_service, tmp_path, requests_mock)
         conn.close()
 
 
+def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock):
+    """
+    Tests that a DELTA load with `include_tables` only affects the specified tables.
+    """
+    # --- 1. Define Schemas and Data for two ChEMBL versions ---
+    v1_version = "102"
+    v2_version = "103"
+    output_dir = tmp_path / "chembl_data"
+    output_dir.mkdir(exist_ok=True)
+
+    # Version 1: Contains molecule_dictionary and target_dictionary
+    v1_sql = """
+    CREATE TABLE molecule_dictionary (molregno integer, pref_name text, chembl_id text);
+    ALTER TABLE ONLY molecule_dictionary ADD CONSTRAINT molecule_dictionary_pkey PRIMARY KEY (molregno);
+    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN', 'CHEMBL1');
+
+    CREATE TABLE target_dictionary (tid integer, pref_name text, target_type text);
+    ALTER TABLE ONLY target_dictionary ADD CONSTRAINT target_dictionary_pkey PRIMARY KEY (tid);
+    INSERT INTO target_dictionary VALUES (101, 'Cytochrome P450', 'ENZYME');
+    """
+    # Version 2: Contains updated data for both tables
+    v2_sql = """
+    CREATE TABLE molecule_dictionary (molregno integer, pref_name text, chembl_id text);
+    ALTER TABLE ONLY molecule_dictionary ADD CONSTRAINT molecule_dictionary_pkey PRIMARY KEY (molregno);
+    INSERT INTO molecule_dictionary VALUES (1, 'ASPIRIN V2', 'CHEMBL1'); -- Updated
+
+    CREATE TABLE target_dictionary (tid integer, pref_name text, target_type text);
+    ALTER TABLE ONLY target_dictionary ADD CONSTRAINT target_dictionary_pkey PRIMARY KEY (tid);
+    INSERT INTO target_dictionary VALUES (101, 'Cytochrome P450 V2', 'ENZYME'); -- Updated
+    """
+    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
+    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
+
+    # --- 2. Setup Mocks ---
+    def setup_mocks(version, gzipped_content):
+        dump_filename = f"chembl_{version}_postgresql.sql.gz"
+        dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/{dump_filename}"
+        checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{version}/checksums.txt"
+        checksum = hashlib.md5(gzipped_content).hexdigest()
+        requests_mock.get(dump_url, content=gzipped_content)
+        requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
+
+    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
+    setup_mocks(v1_version, v1_gzipped_content)
+    setup_mocks(v2_version, v2_gzipped_content)
+
+    # --- 3. Run FULL load for v1 ---
+    adapter = PostgresAdapter(connection_string=postgres_service["uri"])
+    _create_database(postgres_service)
+
+    # Trick pipeline to use .sql.gz for FULL load
+    original_acquire_data = LoaderPipeline._acquire_data
+    def mock_acquire_data(self):
+        original_mode = self.mode
+        self.chembl_version = int(self.version_str)
+        self.mode = 'DELTA'
+        original_acquire_data(self)
+        self.mode = original_mode
+    LoaderPipeline._acquire_data = mock_acquire_data
+
+    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
+    pipeline_v1.run()
+    LoaderPipeline._acquire_data = original_acquire_data # Restore
+
+    # --- 4. Run DELTA load for v2, but only include molecule_dictionary ---
+    pipeline_v2 = LoaderPipeline(
+        version=v2_version,
+        output_dir=output_dir,
+        adapter=adapter,
+        mode="DELTA",
+        include_tables=["molecule_dictionary"], # The key part of this test
+    )
+    pipeline_v2.run()
+
+    # --- 5. Assert final state ---
+    conn = psycopg2.connect(postgres_service["uri"])
+    try:
+        with conn.cursor() as cursor:
+            # Assert that molecule_dictionary was updated
+            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
+            assert cursor.fetchone()[0] == 'ASPIRIN V2'
+
+            # Assert that target_dictionary was NOT updated
+            cursor.execute("SELECT pref_name FROM target_dictionary WHERE tid = 101;")
+            assert cursor.fetchone()[0] == 'Cytochrome P450' # Should still be the V1 name
+
+            # Assert metadata log for the delta load
+            cursor.execute("""
+                SELECT table_name, insert_count, update_count, obsolete_count
+                FROM chembl_loader_meta.load_details
+                WHERE load_id = %s;
+            """, (pipeline_v2.load_id,))
+            details = cursor.fetchall()
+            assert len(details) == 1 # Should only have a record for molecule_dictionary
+            assert details[0][0] == 'molecule_dictionary'
+            assert details[0][2] == 1 # 1 update
+    finally:
+        conn.close()
+
+
 def test_full_load_with_table_subset(postgres_service, tmp_path, requests_mock):
     """
     Tests that a FULL load with the `include_tables` option only loads the
