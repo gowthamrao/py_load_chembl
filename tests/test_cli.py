@@ -24,15 +24,17 @@ def test_load_command_help():
     assert "--representation" in result.stdout
 
 
-@patch('py_load_chembl.cli.api.full_load')
+@patch("py_load_chembl.cli.api.full_load")
 def test_load_command_with_standard_representation(mock_full_load):
     """Tests that using --representation standard calls the API with the correct table list."""
     result = runner.invoke(
         app,
         [
             "load",
-            "--target", "postgresql://fake",
-            "--representation", "standard",
+            "--target",
+            "postgresql://fake",
+            "--representation",
+            "standard",
         ],
     )
     assert result.exit_code == 0
@@ -42,14 +44,15 @@ def test_load_command_with_standard_representation(mock_full_load):
     assert call_kwargs["include_tables"] == STANDARD_TABLE_SUBSET
 
 
-@patch('py_load_chembl.cli.api.full_load')
+@patch("py_load_chembl.cli.api.full_load")
 def test_load_command_with_full_representation(mock_full_load):
     """Tests that the default 'full' representation calls the API with no table list."""
     result = runner.invoke(
         app,
         [
             "load",
-            "--target", "postgresql://fake",
+            "--target",
+            "postgresql://fake",
             # No --representation flag, should default to 'full'
         ],
     )

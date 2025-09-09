@@ -1,6 +1,5 @@
 import hashlib
 from pathlib import Path
-import pytest
 from py_load_chembl import downloader
 
 MOCK_FTP_INDEX_HTML = """
@@ -14,23 +13,38 @@ a1b2c3d4e5f6  chembl_34_postgresql.tar.gz
 g7h8i9j0k1l2  chembl_34_sqlite.tar.gz
 """
 
+
 def test_get_latest_chembl_version(requests_mock):
     """Test that the latest version is correctly parsed from the FTP index."""
     requests_mock.get(downloader.BASE_URL + "/", text=MOCK_FTP_INDEX_HTML)
     latest_version = downloader.get_latest_chembl_version()
     assert latest_version == 34
 
+
 def test_get_chembl_file_urls():
     """Test that the file URLs are constructed correctly for both dump formats."""
     # Test the new default behavior (plain SQL dump)
     sql_url, checksums_url_1 = downloader.get_chembl_file_urls(34)
-    assert sql_url == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.sql.gz"
-    assert checksums_url_1 == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/checksums.txt"
+    assert (
+        sql_url
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.sql.gz"
+    )
+    assert (
+        checksums_url_1
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/checksums.txt"
+    )
 
     # Test the old behavior (pg_restore dump)
     tar_url, checksums_url_2 = downloader.get_chembl_file_urls(34, plain_sql=False)
-    assert tar_url == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.tar.gz"
-    assert checksums_url_2 == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/checksums.txt"
+    assert (
+        tar_url
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/chembl_34_postgresql.tar.gz"
+    )
+    assert (
+        checksums_url_2
+        == "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_34/checksums.txt"
+    )
+
 
 def test_verify_checksum(tmp_path: Path, requests_mock):
     """Test the checksum verification logic."""

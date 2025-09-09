@@ -1,6 +1,7 @@
 import datetime
 import logging
 from pathlib import Path
+from typing import List
 from py_load_chembl._version import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
@@ -14,19 +15,21 @@ class LoaderPipeline:
     The main pipeline for loading ChEMBL data.
     """
 
-from typing import List
-
-class LoaderPipeline:
-    """
-    The main pipeline for loading ChEMBL data.
-    """
-
-    def __init__(self, version: str, output_dir: Path, adapter: DatabaseAdapter | None = None, mode: str | None = None, include_tables: List[str] | None = None):
+    def __init__(
+        self,
+        version: str,
+        output_dir: Path,
+        adapter: DatabaseAdapter | None = None,
+        mode: str | None = None,
+        include_tables: List[str] | None = None,
+    ):
         if mode is None and adapter is None:
             # This is valid for download-only mode
             pass
         elif mode is None or adapter is None:
-            raise ValueError("Both 'mode' and 'adapter' must be provided for loading operations.")
+            raise ValueError(
+                "Both 'mode' and 'adapter' must be provided for loading operations."
+            )
 
         self.adapter = adapter
         self.version_str = version
@@ -41,7 +44,9 @@ class LoaderPipeline:
         """
         Executes the loading pipeline.
         """
-        logger.info(f"Starting ChEMBL load for version '{self.version_str}' in {self.mode} mode.")
+        logger.info(
+            f"Starting ChEMBL load for version '{self.version_str}' in {self.mode} mode."
+        )
         error = None
         try:
             self._log_start_to_db()
@@ -50,17 +55,23 @@ class LoaderPipeline:
             self._acquire_data()
 
             if self.pg_dump_path:
-                logger.info(f"Successfully downloaded and verified ChEMBL {self.chembl_version} to {self.pg_dump_path}")
+                logger.info(
+                    f"Successfully downloaded and verified ChEMBL {self.chembl_version} to {self.pg_dump_path}"
+                )
             else:
-                raise RuntimeError("Data acquisition failed to return a valid file path.")
+                raise RuntimeError(
+                    "Data acquisition failed to return a valid file path."
+                )
 
             # 2. Loading Stage (Full or Delta)
-            if self.mode == 'FULL':
+            if self.mode == "FULL":
                 self._execute_full_load()
-            elif self.mode == 'DELTA':
+            elif self.mode == "DELTA":
                 self._execute_delta_load()
             else:
-                raise ValueError(f"Invalid mode: {self.mode}. Must be 'FULL' or 'DELTA'.")
+                raise ValueError(
+                    f"Invalid mode: {self.mode}. Must be 'FULL' or 'DELTA'."
+                )
 
         except Exception as e:
             error = e
@@ -82,14 +93,18 @@ class LoaderPipeline:
 
         # For DELTA mode, we need the plain SQL dump to load into a staging schema.
         # For FULL mode, the custom .tar.gz format is faster with pg_restore.
-        use_plain_sql = self.mode == 'DELTA'
-        dump_url, checksums_url = downloader.get_chembl_file_urls(self.chembl_version, plain_sql=use_plain_sql)
+        use_plain_sql = self.mode == "DELTA"
+        dump_url, checksums_url = downloader.get_chembl_file_urls(
+            self.chembl_version, plain_sql=use_plain_sql
+        )
 
         logger.info(f"Requesting ChEMBL dump from: {dump_url}")
         # Check if file already exists and is valid before downloading
         local_file = self.output_dir / dump_url.split("/")[-1]
         if local_file.exists():
-            logger.info(f"File '{local_file.name}' already exists. Verifying checksum...")
+            logger.info(
+                f"File '{local_file.name}' already exists. Verifying checksum..."
+            )
             if downloader.verify_checksum(local_file, checksums_url):
                 logger.info("Checksum is valid. Skipping download.")
                 self.pg_dump_path = local_file
@@ -133,12 +148,16 @@ class LoaderPipeline:
             schema="public",
             options={"include_tables": self.include_tables},
         )
-        log_table_name = f"tables: {','.join(self.include_tables)}" if self.include_tables else "all_tables"
+        log_table_name = (
+            f"tables: {','.join(self.include_tables)}"
+            if self.include_tables
+            else "all_tables"
+        )
         self._log_load_details_to_db(table_name=log_table_name, insert_count=-1)
 
         # 3. Post-Processing Stage
         logger.info("--- Stage: Post-Processing ---")
-        self.adapter.optimize_post_load(schema="public") # Schema is illustrative
+        self.adapter.optimize_post_load(schema="public")  # Schema is illustrative
 
     def _execute_delta_load(self):
         """
@@ -146,7 +165,9 @@ class LoaderPipeline:
         temporary staging schema and then merging the data into the production schema.
         """
         if not self.adapter or not self.pg_dump_path:
-            raise RuntimeError("An adapter and data path must be configured for a delta load.")
+            raise RuntimeError(
+                "An adapter and data path must be configured for a delta load."
+            )
 
         logger.info("--- Stage: Delta Load ---")
         staging_schema = f"staging_chembl_{self.chembl_version}"
@@ -154,7 +175,9 @@ class LoaderPipeline:
 
         try:
             # 1. Load new data into a temporary staging schema
-            logger.info(f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'...")
+            logger.info(
+                f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'..."
+            )
             # Note: The .sql.gz dump is required for delta mode.
             self.adapter.bulk_load_table(
                 table_name="all",
@@ -169,11 +192,17 @@ class LoaderPipeline:
             # 3. Get the list of tables to merge from the staging schema
             all_tables_in_staging = self.adapter.get_table_names(schema=staging_schema)
             if self.include_tables:
-                tables_to_merge = [t for t in all_tables_in_staging if t in self.include_tables]
-                logger.info(f"Found {len(all_tables_in_staging)} total tables in staging, but will only process {len(tables_to_merge)} based on the include list.")
+                tables_to_merge = [
+                    t for t in all_tables_in_staging if t in self.include_tables
+                ]
+                logger.info(
+                    f"Found {len(all_tables_in_staging)} total tables in staging, but will only process {len(tables_to_merge)} based on the include list."
+                )
             else:
                 tables_to_merge = all_tables_in_staging
-                logger.info(f"Found {len(tables_to_merge)} tables in staging schema to process.")
+                logger.info(
+                    f"Found {len(tables_to_merge)} tables in staging schema to process."
+                )
 
             # 4. Iterate and merge each table
             for table_name in tables_to_merge:
@@ -189,13 +218,19 @@ class LoaderPipeline:
                 # 4b. Get primary key info from our dynamically parsed schema
                 table_schema_info = chembl_schemas.get(table_name)
                 if not table_schema_info or not table_schema_info.primary_keys:
-                    logger.warning(f"No primary key definition found for table '{table_name}'. Skipping merge.")
+                    logger.warning(
+                        f"No primary key definition found for table '{table_name}'. Skipping merge."
+                    )
                     continue
 
                 # 4c. Introspect the staging table to get all column names for the merge
-                all_columns = self.adapter.get_column_names(schema=staging_schema, table_name=table_name)
+                all_columns = self.adapter.get_column_names(
+                    schema=staging_schema, table_name=table_name
+                )
                 if not all_columns:
-                    logger.warning(f"Could not find columns for table '{table_name}'. Skipping merge.")
+                    logger.warning(
+                        f"Could not find columns for table '{table_name}'. Skipping merge."
+                    )
                     continue
 
                 # 4d. Perform the merge from staging to production
@@ -209,7 +244,7 @@ class LoaderPipeline:
                     table_name=table_name,
                     insert_count=merge_stats.get("inserted", 0),
                     update_count=merge_stats.get("updated", 0),
-                    obsolete_count=0, # Obsolete count is handled in a separate step now
+                    obsolete_count=0,  # Obsolete count is handled in a separate step now
                 )
 
             # 5. Handle obsolete records using the correct FRD-compliant method.
@@ -221,8 +256,8 @@ class LoaderPipeline:
             )
             self._log_load_details_to_db(
                 table_name="chembl_id_lookup",
-                insert_count=0, # Already logged during its own merge
-                update_count=0, # Already logged
+                insert_count=0,  # Already logged during its own merge
+                update_count=0,  # Already logged
                 obsolete_count=obsolete_count,
             )
 
@@ -232,7 +267,9 @@ class LoaderPipeline:
             self.adapter.execute_sql(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
             logger.info("Cleanup complete.")
 
-    def _perform_schema_migration(self, source_schema: str, target_schema: str, table_name: str):
+    def _perform_schema_migration(
+        self, source_schema: str, target_schema: str, table_name: str
+    ):
         """
         Orchestrates schema migration for a single table. It uses the adapter's
         generic methods to compare schemas and apply additive changes.
@@ -247,7 +284,9 @@ class LoaderPipeline:
         # Check if target table exists
         target_table_exists = self.adapter.get_table_names(target_schema)
         if table_name not in target_table_exists:
-            logger.info(f"Target table '{target_schema}.{table_name}' does not exist. Creating it.")
+            logger.info(
+                f"Target table '{target_schema}.{table_name}' does not exist. Creating it."
+            )
             # This LIKE statement is specific to PostgreSQL but is a reasonable default.
             # A more advanced implementation might use an abstract method in the adapter.
             create_sql = f'CREATE TABLE "{target_schema}"."{table_name}" (LIKE "{source_schema}"."{table_name}" INCLUDING ALL);'
@@ -256,10 +295,14 @@ class LoaderPipeline:
             return
 
         # Get column definitions from source and target to find new columns
-        source_cols = self.adapter.get_column_definitions(schema=source_schema, table_name=table_name)
-        target_cols = self.adapter.get_column_definitions(schema=target_schema, table_name=table_name)
-        source_col_names = {c['name'] for c in source_cols}
-        target_col_names = {c['name'] for c in target_cols}
+        source_cols = self.adapter.get_column_definitions(
+            schema=source_schema, table_name=table_name
+        )
+        target_cols = self.adapter.get_column_definitions(
+            schema=target_schema, table_name=table_name
+        )
+        source_col_names = {c["name"] for c in source_cols}
+        target_col_names = {c["name"] for c in target_cols}
 
         new_columns = source_col_names - target_col_names
 
@@ -267,12 +310,14 @@ class LoaderPipeline:
             logger.info(f"No schema changes found for table '{table_name}'.")
             return
 
-        logger.info(f"Found new columns to add to '{table_name}': {', '.join(new_columns)}")
+        logger.info(
+            f"Found new columns to add to '{table_name}': {', '.join(new_columns)}"
+        )
         for col in source_cols:
-            if col['name'] in new_columns:
+            if col["name"] in new_columns:
                 # Construct the full data type, e.g., "VARCHAR(255)"
-                data_type = col['type']
-                if col.get('length'):
+                data_type = col["type"]
+                if col.get("length"):
                     data_type = f"{data_type}({col['length']})"
 
                 alter_sql = f'ALTER TABLE "{target_schema}"."{table_name}" ADD COLUMN "{col["name"]}" {data_type};'
@@ -296,10 +341,10 @@ class LoaderPipeline:
             str(self.chembl_version) if self.chembl_version else self.version_str,
             self.mode,
             datetime.datetime.now(datetime.timezone.utc),
-            'RUNNING',
-            __version__
+            "RUNNING",
+            __version__,
         )
-        result = self.adapter.execute_sql(sql, params, fetch='one')
+        result = self.adapter.execute_sql(sql, params, fetch="one")
         self.load_id = result[0]
         logger.info(f"Logging to database with load_id: {self.load_id}")
 
@@ -308,10 +353,12 @@ class LoaderPipeline:
         if not self.adapter or not self.load_id:
             return
 
-        status = 'FAILED' if error else 'SUCCESS'
+        status = "FAILED" if error else "SUCCESS"
         error_message = str(error) if error else None
 
-        logger.info(f"Finalizing load_id {self.load_id} in database with status: {status}")
+        logger.info(
+            f"Finalizing load_id {self.load_id} in database with status: {status}"
+        )
 
         sql = """
             UPDATE chembl_loader_meta.load_history
@@ -322,11 +369,18 @@ class LoaderPipeline:
             datetime.datetime.now(datetime.timezone.utc),
             status,
             error_message,
-            self.load_id
+            self.load_id,
         )
         self.adapter.execute_sql(sql, params)
 
-    def _log_load_details_to_db(self, table_name: str, stage_record_count: int = 0, insert_count: int = 0, update_count: int = 0, obsolete_count: int = 0):
+    def _log_load_details_to_db(
+        self,
+        table_name: str,
+        stage_record_count: int = 0,
+        insert_count: int = 0,
+        update_count: int = 0,
+        obsolete_count: int = 0,
+    ):
         """Logs the details for a specific table load to the database."""
         if not self.adapter or not self.load_id:
             return
@@ -336,5 +390,12 @@ class LoaderPipeline:
             (load_id, table_name, stage_record_count, insert_count, update_count, obsolete_count)
             VALUES (%s, %s, %s, %s, %s, %s);
         """
-        params = (self.load_id, table_name, stage_record_count, insert_count, update_count, obsolete_count)
+        params = (
+            self.load_id,
+            table_name,
+            stage_record_count,
+            insert_count,
+            update_count,
+            obsolete_count,
+        )
         self.adapter.execute_sql(sql, params)

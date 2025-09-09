@@ -35,10 +35,12 @@ ALTER TABLE ONLY assay_type
     ADD CONSTRAINT assay_type_pkey PRIMARY KEY (assay_type, assay_desc);
 """
 
+
 @pytest.fixture
 def ddl_file(tmp_path: Path) -> Path:
     """Creates a dummy gzipped DDL file for testing."""
     import gzip
+
     file_path = tmp_path / "test.sql.gz"
     with gzip.open(file_path, "wt", encoding="utf-8") as f:
         f.write(SAMPLE_DDL)
@@ -73,12 +75,14 @@ def test_parse_chembl_ddl(ddl_file: Path):
     assay_type_schema = schemas["assay_type"]
     assert assay_type_schema.primary_keys == ["assay_type", "assay_desc"]
 
+
 def test_parse_empty_ddl(tmp_path: Path):
     """
     Tests that the parser handles an empty DDL file gracefully.
     """
     # Arrange
     import gzip
+
     file_path = tmp_path / "empty.sql.gz"
     with gzip.open(file_path, "wt", encoding="utf-8") as f:
         f.write("")

@@ -1,22 +1,22 @@
-import os
 import pytest
 import psycopg2
 import gzip
 import hashlib
-import tempfile
 import tarfile
 from pathlib import Path
-import requests_mock
 import io
 import json
 import logging
 from unittest.mock import patch
 
+from py_load_chembl.config import STANDARD_TABLE_SUBSET
+from py_load_chembl.logging_config import JsonFormatter
 from py_load_chembl.pipeline import LoaderPipeline
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
 # Mark all tests in this file as integration tests
 pytestmark = pytest.mark.integration
+
 
 @pytest.fixture(scope="module")
 def postgres_service(docker_ip, docker_services):
@@ -32,7 +32,9 @@ def postgres_service(docker_ip, docker_services):
 
     # Wait for the postgres service to be ready
     docker_services.wait_until_responsive(
-        timeout=30.0, pause=0.5, check=lambda: is_postgres_ready(host, port, user, password, dbname)
+        timeout=30.0,
+        pause=0.5,
+        check=lambda: is_postgres_ready(host, port, user, password, dbname),
     )
 
     return {
@@ -49,15 +51,18 @@ def is_postgres_ready(host, port, user, password, dbname):
     """Check if the postgres container is ready to accept connections."""
     try:
         conn = psycopg2.connect(
-            host=host, port=port, user=user, password=password, dbname=dbname, connect_timeout=2
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            dbname=dbname,
+            connect_timeout=2,
         )
         conn.close()
         return True
     except psycopg2.OperationalError:
         return False
 
-
-from py_load_chembl.logging_config import JsonFormatter
 
 def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
     """
@@ -71,7 +76,7 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
     test_data_dir = Path(__file__).parent / "test_data"
     test_sql_path = test_data_dir / "chembl_xx_postgresql" / "chembl_xx.sql"
     test_sql_content = test_sql_path.read_text()
-    gzipped_sql_content = gzip.compress(test_sql_content.encode('utf-8'))
+    gzipped_sql_content = gzip.compress(test_sql_content.encode("utf-8"))
 
     chembl_version = "99"
     base_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}"
@@ -80,7 +85,10 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
     checksum_url = f"{base_url}/checksums.txt"
 
     # --- 2. Mock all external HTTP requests ---
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{chembl_version}/"></a>')
+    requests_mock.get(
+        "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
+        text=f'<a href="chembl_{chembl_version}/"></a>',
+    )
 
     # Mock checksum file download
     checksum_md5 = hashlib.md5(gzipped_sql_content).hexdigest()
@@ -97,13 +105,14 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
     # We need to temporarily adjust the pipeline logic for the test, so a FULL load
     # uses a .sql.gz file instead of a .tar.gz file.
     original_acquire_data = LoaderPipeline._acquire_data
+
     def mock_acquire_data(self):
         self.chembl_version = int(self.version_str)
         # Force the pipeline to think it's in DELTA mode for file acquisition purposes
-        self.mode = 'DELTA'
+        self.mode = "DELTA"
         original_acquire_data(self)
         # Set the mode back to FULL for the loading logic
-        self.mode = 'FULL'
+        self.mode = "FULL"
 
     LoaderPipeline._acquire_data = mock_acquire_data
 
@@ -127,28 +136,49 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
             count = cursor.fetchone()[0]
             assert count == 2
 
-            cursor.execute("SELECT chembl_id, pref_name FROM molecule_dictionary WHERE molregno = 1;")
+            cursor.execute(
+                "SELECT chembl_id, pref_name FROM molecule_dictionary WHERE molregno = 1;"
+            )
             chembl_id, pref_name = cursor.fetchone()
             assert chembl_id == "CHEMBL1"
             assert pref_name == "ASPIRIN"
 
         # --- 5. Assert logging ---
-        log_records = [json.loads(rec) for rec in caplog.text.strip().split('\n') if rec]
+        log_records = [
+            json.loads(rec) for rec in caplog.text.strip().split("\n") if rec
+        ]
 
         # Check for a log from the pipeline
-        pipeline_start_log = next((rec for rec in log_records if "Starting ChEMBL load" in rec["message"]), None)
+        pipeline_start_log = next(
+            (rec for rec in log_records if "Starting ChEMBL load" in rec["message"]),
+            None,
+        )
         assert pipeline_start_log is not None
         assert pipeline_start_log["level"] == "INFO"
         assert pipeline_start_log["name"] == "py_load_chembl.pipeline"
 
         # Check for a log from the adapter
-        adapter_log = next((rec for rec in log_records if "Schema-specific restore completed" in rec["message"]), None)
+        adapter_log = next(
+            (
+                rec
+                for rec in log_records
+                if "Schema-specific restore completed" in rec["message"]
+            ),
+            None,
+        )
         assert adapter_log is not None
         assert adapter_log["level"] == "INFO"
         assert adapter_log["name"] == "py_load_chembl.adapters.postgres"
 
         # Check for a database logging message
-        db_log = next((rec for rec in log_records if "Logging to database with load_id" in rec["message"]), None)
+        db_log = next(
+            (
+                rec
+                for rec in log_records
+                if "Logging to database with load_id" in rec["message"]
+            ),
+            None,
+        )
         assert db_log is not None
         assert db_log["level"] == "INFO"
 
@@ -157,7 +187,9 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
             conn.close()
 
 
-def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock, caplog):
+def test_postgres_delta_load_workflow(
+    postgres_service, tmp_path, requests_mock, caplog
+):
     """
     Tests the new, robust delta load workflow.
     1. Runs a full load to establish an initial "production" state.
@@ -175,16 +207,20 @@ def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock,
     try:
         with conn.cursor() as cursor:
             # This record will be updated by the delta load
-            cursor.execute("UPDATE molecule_dictionary SET pref_name = 'OLD ASPIRIN' WHERE molregno = 1;")
+            cursor.execute(
+                "UPDATE molecule_dictionary SET pref_name = 'OLD ASPIRIN' WHERE molregno = 1;"
+            )
             # This record should not be touched
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;")
+            cursor.execute(
+                "SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;"
+            )
             assert cursor.fetchone()[0] == "IBUPROFEN"
         conn.commit()
     finally:
         conn.close()
 
     # --- 3. Configure and run the pipeline in DELTA mode ---
-    chembl_version = "99" # Must match version from full_load test
+    chembl_version = "99"  # Must match version from full_load test
     output_dir = tmp_path / "chembl_data"
 
     # The delta load requires a .sql.gz file, which was not mocked by the full_load test.
@@ -196,7 +232,6 @@ def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock,
 
     delta_dump_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/chembl_{chembl_version}_postgresql.sql.gz"
     requests_mock.get(delta_dump_url, content=test_sql_content.read_bytes())
-
 
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     pipeline = LoaderPipeline(
@@ -212,11 +247,15 @@ def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock,
     try:
         with conn.cursor() as cursor:
             # Assert that the record was updated back to its original name
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
+            cursor.execute(
+                "SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;"
+            )
             assert cursor.fetchone()[0] == "ASPIRIN"
 
             # Assert that the other record was not changed
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;")
+            cursor.execute(
+                "SELECT pref_name FROM molecule_dictionary WHERE molregno = 2;"
+            )
             assert cursor.fetchone()[0] == "IBUPROFEN"
 
             # Assert that no new records were added
@@ -225,11 +264,19 @@ def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock,
 
             # Assert that the staging schema was dropped
             staging_schema = f"staging_chembl_{chembl_version}"
-            cursor.execute("SELECT 1 FROM information_schema.schemata WHERE schema_name = %s;", (staging_schema,))
-            assert cursor.fetchone() is None, f"Staging schema '{staging_schema}' was not dropped."
+            cursor.execute(
+                "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s;",
+                (staging_schema,),
+            )
+            assert (
+                cursor.fetchone() is None
+            ), f"Staging schema '{staging_schema}' was not dropped."
 
             # Assert the metadata tables for the DELTA load
-            cursor.execute("SELECT insert_count, update_count FROM chembl_loader_meta.load_details WHERE load_id = %s AND table_name = 'molecule_dictionary';", (pipeline.load_id,))
+            cursor.execute(
+                "SELECT insert_count, update_count FROM chembl_loader_meta.load_details WHERE load_id = %s AND table_name = 'molecule_dictionary';",
+                (pipeline.load_id,),
+            )
             insert_count, update_count = cursor.fetchone()
             assert insert_count == 0  # No new records were inserted
             # The UPSERT will update all conflicting rows, even if values are the same.
@@ -246,12 +293,14 @@ def _create_database(pg_config):
         port=pg_config["port"],
         user=pg_config["user"],
         password=pg_config["password"],
-        dbname="postgres" # Default db that always exists
+        dbname="postgres",  # Default db that always exists
     )
     conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
 
     with conn.cursor() as cursor:
-        cursor.execute(f"SELECT 1 FROM pg_database WHERE datname = '{pg_config['dbname']}'")
+        cursor.execute(
+            f"SELECT 1 FROM pg_database WHERE datname = '{pg_config['dbname']}'"
+        )
         exists = cursor.fetchone()
         if not exists:
             print(f"Database '{pg_config['dbname']}' does not exist. Creating it...")
@@ -263,13 +312,15 @@ def _create_database(pg_config):
 
     conn.close()
 
+
 def _cleanup_db(pg_config):
     """Connects to the test DB and drops all public tables."""
     try:
         conn = psycopg2.connect(pg_config["uri"])
         with conn.cursor() as cursor:
             # Drop all tables in the public schema
-            cursor.execute("""
+            cursor.execute(
+                """
                 DO $$ DECLARE
                     r RECORD;
                 BEGIN
@@ -277,7 +328,8 @@ def _cleanup_db(pg_config):
                         EXECUTE 'DROP TABLE IF EXISTS ' || quote_ident(r.tablename) || ' CASCADE';
                     END LOOP;
                 END $$;
-            """)
+            """
+            )
         conn.commit()
         conn.close()
         print(f"Cleaned up tables in database '{pg_config['dbname']}'.")
@@ -285,8 +337,6 @@ def _cleanup_db(pg_config):
         # This can happen if the DB doesn't exist yet, which is fine.
         pass
 
-
-from py_load_chembl.schema_parser import parse_chembl_ddl
 
 def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_mock):
     """
@@ -319,8 +369,8 @@ def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_m
     ALTER TABLE ONLY target_dictionary ADD CONSTRAINT target_dictionary_pkey PRIMARY KEY (tid);
     INSERT INTO target_dictionary VALUES (101, 'Cytochrome P450', 'ENZYME');
     """
-    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
-    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
+    v1_gzipped_content = gzip.compress(v1_sql.encode("utf-8"))
+    v2_gzipped_content = gzip.compress(v2_sql.encode("utf-8"))
 
     # --- 2. Setup Mocks ---
     def setup_mocks(version, gzipped_content):
@@ -331,7 +381,10 @@ def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_m
         requests_mock.get(dump_url, content=gzipped_content)
         requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
 
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
+    requests_mock.get(
+        "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
+        text=f'<a href="chembl_{v2_version}/"></a>',
+    )
     setup_mocks(v1_version, v1_gzipped_content)
     setup_mocks(v2_version, v2_gzipped_content)
 
@@ -342,38 +395,48 @@ def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_m
     # To test a FULL load with a SQL file, we must trick the pipeline into downloading
     # the .sql.gz file. We can do this by temporarily setting the mode to DELTA during acquisition.
     original_acquire_data = LoaderPipeline._acquire_data
+
     def mock_acquire_data(self):
         original_mode = self.mode
         self.chembl_version = int(self.version_str)
-        self.mode = 'DELTA' # Force download of .sql.gz
+        self.mode = "DELTA"  # Force download of .sql.gz
         original_acquire_data(self)
-        self.mode = original_mode # Restore original mode for loading
+        self.mode = original_mode  # Restore original mode for loading
+
     LoaderPipeline._acquire_data = mock_acquire_data
 
-    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
+    pipeline_v1 = LoaderPipeline(
+        version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL"
+    )
     pipeline_v1.run()
 
-    LoaderPipeline._acquire_data = original_acquire_data # Restore
+    LoaderPipeline._acquire_data = original_acquire_data  # Restore
 
     # --- 4. Assert initial state after v1 load ---
     conn = psycopg2.connect(postgres_service["uri"])
     with conn.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
         assert cursor.fetchone()[0] == 1
-        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary';")
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary';"
+        )
         assert len(cursor.fetchall()) == 3
         cursor.execute("SELECT to_regclass('public.target_dictionary');")
         assert cursor.fetchone()[0] is None
 
     # --- 5. Run DELTA load for v2 ---
-    pipeline_v2 = LoaderPipeline(version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA")
+    pipeline_v2 = LoaderPipeline(
+        version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA"
+    )
     pipeline_v2.run()
 
     # --- 6. Assert final state after v2 delta load ---
     with conn.cursor() as cursor:
         # Assert schema migration: new column exists
-        cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary' AND column_name = 'is_natural_product';")
-        assert cursor.fetchone()[0] == 'is_natural_product'
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'molecule_dictionary' AND column_name = 'is_natural_product';"
+        )
+        assert cursor.fetchone()[0] == "is_natural_product"
 
         # Assert schema migration: new table exists
         cursor.execute("SELECT COUNT(*) FROM target_dictionary;")
@@ -381,7 +444,7 @@ def test_delta_load_with_schema_migration(postgres_service, tmp_path, requests_m
 
         # Assert data merge: update
         cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
-        assert cursor.fetchone()[0] == 'ASPIRIN V2'
+        assert cursor.fetchone()[0] == "ASPIRIN V2"
 
         # Assert data merge: insert
         cursor.execute("SELECT COUNT(*) FROM molecule_dictionary;")
@@ -420,8 +483,8 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
     ALTER TABLE ONLY target_dictionary ADD CONSTRAINT target_dictionary_pkey PRIMARY KEY (tid);
     INSERT INTO target_dictionary VALUES (101, 'Cytochrome P450 V2', 'ENZYME'); -- Updated
     """
-    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
-    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
+    v1_gzipped_content = gzip.compress(v1_sql.encode("utf-8"))
+    v2_gzipped_content = gzip.compress(v2_sql.encode("utf-8"))
 
     # --- 2. Setup Mocks ---
     def setup_mocks(version, gzipped_content):
@@ -432,7 +495,10 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
         requests_mock.get(dump_url, content=gzipped_content)
         requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
 
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
+    requests_mock.get(
+        "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
+        text=f'<a href="chembl_{v2_version}/"></a>',
+    )
     setup_mocks(v1_version, v1_gzipped_content)
     setup_mocks(v2_version, v2_gzipped_content)
 
@@ -442,17 +508,21 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
 
     # Trick pipeline to use .sql.gz for FULL load
     original_acquire_data = LoaderPipeline._acquire_data
+
     def mock_acquire_data(self):
         original_mode = self.mode
         self.chembl_version = int(self.version_str)
-        self.mode = 'DELTA'
+        self.mode = "DELTA"
         original_acquire_data(self)
         self.mode = original_mode
+
     LoaderPipeline._acquire_data = mock_acquire_data
 
-    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
+    pipeline_v1 = LoaderPipeline(
+        version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL"
+    )
     pipeline_v1.run()
-    LoaderPipeline._acquire_data = original_acquire_data # Restore
+    LoaderPipeline._acquire_data = original_acquire_data  # Restore
 
     # --- 4. Run DELTA load for v2, but only include molecule_dictionary ---
     pipeline_v2 = LoaderPipeline(
@@ -460,7 +530,7 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
         output_dir=output_dir,
         adapter=adapter,
         mode="DELTA",
-        include_tables=["molecule_dictionary"], # The key part of this test
+        include_tables=["molecule_dictionary"],  # The key part of this test
     )
     pipeline_v2.run()
 
@@ -469,31 +539,40 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
     try:
         with conn.cursor() as cursor:
             # Assert that molecule_dictionary was updated
-            cursor.execute("SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;")
-            assert cursor.fetchone()[0] == 'ASPIRIN V2'
+            cursor.execute(
+                "SELECT pref_name FROM molecule_dictionary WHERE molregno = 1;"
+            )
+            assert cursor.fetchone()[0] == "ASPIRIN V2"
 
             # Assert that target_dictionary was NOT updated
             cursor.execute("SELECT pref_name FROM target_dictionary WHERE tid = 101;")
-            assert cursor.fetchone()[0] == 'Cytochrome P450' # Should still be the V1 name
+            assert (
+                cursor.fetchone()[0] == "Cytochrome P450"
+            )  # Should still be the V1 name
 
             # Assert metadata log for the delta load
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT table_name, insert_count, update_count, obsolete_count
                 FROM chembl_loader_meta.load_details
                 WHERE load_id = %s;
-            """, (pipeline_v2.load_id,))
+            """,
+                (pipeline_v2.load_id,),
+            )
             details = cursor.fetchall()
-            assert len(details) == 1 # Should only have a record for molecule_dictionary
-            assert details[0][0] == 'molecule_dictionary'
-            assert details[0][2] == 1 # 1 update
+            assert (
+                len(details) == 1
+            )  # Should only have a record for molecule_dictionary
+            assert details[0][0] == "molecule_dictionary"
+            assert details[0][2] == 1  # 1 update
     finally:
         conn.close()
 
 
-from py_load_chembl.config import STANDARD_TABLE_SUBSET
-
 @patch("subprocess.run")
-def test_full_load_standard_representation_mocked(mock_subprocess_run, postgres_service, tmp_path, requests_mock):
+def test_full_load_standard_representation_mocked(
+    mock_subprocess_run, postgres_service, tmp_path, requests_mock
+):
     """
     Tests that a FULL load with the 'standard' representation correctly calls
     pg_restore with the appropriate --table arguments for the standard subset.
@@ -515,7 +594,10 @@ def test_full_load_standard_representation_mocked(mock_subprocess_run, postgres_
     tar_gz_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/{tar_gz_filename}"
     checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/checksums.txt"
     checksum = hashlib.md5(tar_gz_content).hexdigest()
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{chembl_version}/"></a>')
+    requests_mock.get(
+        "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
+        text=f'<a href="chembl_{chembl_version}/"></a>',
+    )
     requests_mock.get(tar_gz_url, content=tar_gz_content)
     requests_mock.get(checksum_url, text=f"{checksum}  {tar_gz_filename}")
 
@@ -530,7 +612,7 @@ def test_full_load_standard_representation_mocked(mock_subprocess_run, postgres_
         version=chembl_version,
         mode="FULL",
         output_dir=output_dir,
-        include_tables=STANDARD_TABLE_SUBSET, # Use the official standard subset
+        include_tables=STANDARD_TABLE_SUBSET,  # Use the official standard subset
     )
     pipeline.run()
 
@@ -542,7 +624,7 @@ def test_full_load_standard_representation_mocked(mock_subprocess_run, postgres_
     table_flag_indices = [i for i, arg in enumerate(call_args) if arg == "--table"]
     assert len(table_flag_indices) == len(STANDARD_TABLE_SUBSET)
     for i in table_flag_indices:
-        assert call_args[i+1] in STANDARD_TABLE_SUBSET
+        assert call_args[i + 1] in STANDARD_TABLE_SUBSET
 
 
 def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, requests_mock):
@@ -571,8 +653,8 @@ def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, request
     INSERT INTO chembl_id_lookup VALUES ('CHEMBL2', 'ASSAY', 'ACTIVE');     -- Unchanged
     INSERT INTO chembl_id_lookup VALUES ('CHEMBL3', 'COMPOUND', 'ACTIVE'); -- New
     """
-    v1_gzipped_content = gzip.compress(v1_sql.encode('utf-8'))
-    v2_gzipped_content = gzip.compress(v2_sql.encode('utf-8'))
+    v1_gzipped_content = gzip.compress(v1_sql.encode("utf-8"))
+    v2_gzipped_content = gzip.compress(v2_sql.encode("utf-8"))
 
     # --- 2. Setup Mocks ---
     def setup_mocks(version, gzipped_content):
@@ -583,7 +665,10 @@ def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, request
         requests_mock.get(dump_url, content=gzipped_content)
         requests_mock.get(checksum_url, text=f"{checksum}  {dump_filename}")
 
-    requests_mock.get("https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/", text=f'<a href="chembl_{v2_version}/"></a>')
+    requests_mock.get(
+        "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
+        text=f'<a href="chembl_{v2_version}/"></a>',
+    )
     setup_mocks(v1_version, v1_gzipped_content)
     setup_mocks(v2_version, v2_gzipped_content)
 
@@ -592,19 +677,25 @@ def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, request
     _create_database(postgres_service)
     # Trick pipeline to use .sql.gz for FULL load
     original_acquire_data = LoaderPipeline._acquire_data
+
     def mock_acquire_data(self):
         original_mode = self.mode
         self.chembl_version = int(self.version_str)
-        self.mode = 'DELTA'
+        self.mode = "DELTA"
         original_acquire_data(self)
         self.mode = original_mode
+
     LoaderPipeline._acquire_data = mock_acquire_data
-    pipeline_v1 = LoaderPipeline(version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL")
+    pipeline_v1 = LoaderPipeline(
+        version=v1_version, output_dir=output_dir, adapter=adapter, mode="FULL"
+    )
     pipeline_v1.run()
-    LoaderPipeline._acquire_data = original_acquire_data # Restore
+    LoaderPipeline._acquire_data = original_acquire_data  # Restore
 
     # --- 4. Run DELTA load for v2 ---
-    pipeline_v2 = LoaderPipeline(version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA")
+    pipeline_v2 = LoaderPipeline(
+        version=v2_version, output_dir=output_dir, adapter=adapter, mode="DELTA"
+    )
     pipeline_v2.run()
 
     # --- 5. Assert final state ---
@@ -612,38 +703,51 @@ def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, request
     try:
         with conn.cursor() as cursor:
             # Check the statuses in the final table
-            cursor.execute("SELECT chembl_id, status FROM chembl_id_lookup ORDER BY chembl_id;")
+            cursor.execute(
+                "SELECT chembl_id, status FROM chembl_id_lookup ORDER BY chembl_id;"
+            )
             results = dict(cursor.fetchall())
 
             assert len(results) == 3
-            assert results['CHEMBL1'] == 'OBSOLETE' # Correctly updated
-            assert results['CHEMBL2'] == 'ACTIVE'   # Unchanged
-            assert results['CHEMBL3'] == 'ACTIVE'   # Correctly inserted
+            assert results["CHEMBL1"] == "OBSOLETE"  # Correctly updated
+            assert results["CHEMBL2"] == "ACTIVE"  # Unchanged
+            assert results["CHEMBL3"] == "ACTIVE"  # Correctly inserted
 
             # Assert that no 'is_deleted' column was ever created
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT 1 FROM information_schema.columns
                 WHERE table_schema = 'public'
                 AND table_name = 'chembl_id_lookup'
                 AND column_name = 'is_deleted';
-            """)
+            """
+            )
             assert cursor.fetchone() is None, "'is_deleted' column should not exist."
 
             # Assert metadata log for the delta load
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT insert_count, update_count, obsolete_count
                 FROM chembl_loader_meta.load_details
                 WHERE load_id = %s AND table_name = 'chembl_id_lookup';
-            """, (pipeline_v2.load_id,))
+            """,
+                (pipeline_v2.load_id,),
+            )
             insert_count, update_count, obsolete_count = cursor.fetchone()
             assert insert_count == 1  # CHEMBL3
-            assert update_count == 1  # CHEMBL2 was reaffirmed, CHEMBL1 was updated by the merge itself
-            assert obsolete_count == 1  # The handle_obsolete_records step should log one change
+            assert (
+                update_count == 1
+            )  # CHEMBL2 was reaffirmed, CHEMBL1 was updated by the merge itself
+            assert (
+                obsolete_count == 1
+            )  # The handle_obsolete_records step should log one change
     finally:
         conn.close()
 
 
-def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock, caplog):
+def test_full_load_with_optimizations(
+    postgres_service, tmp_path, requests_mock, caplog
+):
     """
     Tests that the full load process correctly uses the pre/post load optimizations.
     Specifically, it should drop pre-existing constraints and indexes before the load.
@@ -656,19 +760,27 @@ def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock,
     try:
         with conn.cursor() as cursor:
             # Add a dummy, non-standard index
-            cursor.execute("CREATE INDEX idx_dummy_test ON public.molecule_dictionary (pref_name);")
+            cursor.execute(
+                "CREATE INDEX idx_dummy_test ON public.molecule_dictionary (pref_name);"
+            )
             # Add a dummy, non-standard foreign key.
             # First, add a dummy table to reference.
             cursor.execute("CREATE TABLE dummy_ref_table (id integer primary key);")
             cursor.execute("INSERT INTO dummy_ref_table (id) VALUES (1), (2);")
             # Then add a column to molecule_dictionary to create the FK on.
-            cursor.execute("ALTER TABLE public.molecule_dictionary ADD COLUMN dummy_ref_id INTEGER;")
-            cursor.execute("UPDATE public.molecule_dictionary SET dummy_ref_id = molregno;")
-            cursor.execute("""
+            cursor.execute(
+                "ALTER TABLE public.molecule_dictionary ADD COLUMN dummy_ref_id INTEGER;"
+            )
+            cursor.execute(
+                "UPDATE public.molecule_dictionary SET dummy_ref_id = molregno;"
+            )
+            cursor.execute(
+                """
                 ALTER TABLE public.molecule_dictionary
                 ADD CONSTRAINT fk_dummy_test
                 FOREIGN KEY (dummy_ref_id) REFERENCES public.dummy_ref_table(id);
-            """)
+            """
+            )
         conn.commit()
     finally:
         conn.close()
@@ -681,11 +793,13 @@ def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock,
 
     # We need to use the same mock for _acquire_data as the main full load test
     original_acquire_data = LoaderPipeline._acquire_data
+
     def mock_acquire_data(self):
         self.chembl_version = int(self.version_str)
-        self.mode = 'DELTA'
+        self.mode = "DELTA"
         original_acquire_data(self)
-        self.mode = 'FULL'
+        self.mode = "FULL"
+
     LoaderPipeline._acquire_data = mock_acquire_data
 
     pipeline = LoaderPipeline(
@@ -696,30 +810,40 @@ def test_full_load_with_optimizations(postgres_service, tmp_path, requests_mock,
     )
     pipeline.run()
 
-    LoaderPipeline._acquire_data = original_acquire_data # Restore
+    LoaderPipeline._acquire_data = original_acquire_data  # Restore
 
     # --- 4. Assert that the dummy objects were dropped ---
     conn = psycopg2.connect(postgres_service["uri"])
     try:
         with conn.cursor() as cursor:
             # Check that the dummy index is gone
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = 'idx_dummy_test';
-            """)
-            assert cursor.fetchone() is None, "Dummy index should have been dropped by the full load."
+            """
+            )
+            assert (
+                cursor.fetchone() is None
+            ), "Dummy index should have been dropped by the full load."
 
             # Check that the dummy foreign key is gone
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT 1 FROM information_schema.table_constraints
                 WHERE constraint_schema = 'public' AND constraint_name = 'fk_dummy_test';
-            """)
-            assert cursor.fetchone() is None, "Dummy foreign key should have been dropped by the full load."
+            """
+            )
+            assert (
+                cursor.fetchone() is None
+            ), "Dummy foreign key should have been dropped by the full load."
 
             # Check that the legitimate primary key still exists
-            cursor.execute("""
+            cursor.execute(
+                """
                 SELECT 1 FROM information_schema.table_constraints
                 WHERE constraint_schema = 'public' AND constraint_name = 'molecule_dictionary_pkey';
-            """)
+            """
+            )
             assert cursor.fetchone() is not None, "Legitimate primary key should exist."
 
     finally:

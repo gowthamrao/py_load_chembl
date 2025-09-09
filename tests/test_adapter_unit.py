@@ -4,15 +4,20 @@ from pathlib import Path
 
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
-class TestPostgresAdapterUnit(unittest.TestCase):
 
-    @patch('shutil.which', return_value=True)
-    @patch('tempfile.TemporaryDirectory')
-    @patch('tarfile.open')
-    @patch('subprocess.run')
-    @patch.object(PostgresAdapter, 'execute_sql')
+class TestPostgresAdapterUnit(unittest.TestCase):
+    @patch("shutil.which", return_value=True)
+    @patch("tempfile.TemporaryDirectory")
+    @patch("tarfile.open")
+    @patch("subprocess.run")
+    @patch.object(PostgresAdapter, "execute_sql")
     def test_run_pg_restore_with_table_list(
-        self, mock_execute_sql, mock_subprocess_run, mock_tarfile_open, mock_temp_dir, mock_shutil_which
+        self,
+        mock_execute_sql,
+        mock_subprocess_run,
+        mock_tarfile_open,
+        mock_temp_dir,
+        mock_shutil_which,
     ):
         """
         Tests that _run_pg_restore correctly constructs the pg_restore command
@@ -20,7 +25,7 @@ class TestPostgresAdapterUnit(unittest.TestCase):
         """
         # --- Setup Mocks ---
         # Mock the context manager for TemporaryDirectory
-        mock_temp_dir.return_value.__enter__.return_value = '/fake/temp/dir'
+        mock_temp_dir.return_value.__enter__.return_value = "/fake/temp/dir"
 
         # Mock the Path object's behavior.
         mock_path_instance = MagicMock()
@@ -29,7 +34,9 @@ class TestPostgresAdapterUnit(unittest.TestCase):
         mock_path_instance.iterdir.return_value = [mock_dir_in_list]
 
         # Patch the Path class in the adapter's module
-        with patch('py_load_chembl.adapters.postgres.Path', return_value=mock_path_instance):
+        with patch(
+            "py_load_chembl.adapters.postgres.Path", return_value=mock_path_instance
+        ):
             # --- Setup Adapter and arguments ---
             adapter = PostgresAdapter("postgresql://user:pass@host/db")
             dump_path = Path("/fake/dump.tar.gz")
@@ -63,18 +70,23 @@ class TestPostgresAdapterUnit(unittest.TestCase):
             comp_struct_index = command_list.index("compound_structures")
             self.assertEqual(command_list[comp_struct_index - 1], "--table")
 
-    @patch('shutil.which', return_value=True)
-    @patch('tempfile.TemporaryDirectory')
-    @patch('tarfile.open')
-    @patch('subprocess.run')
-    @patch.object(PostgresAdapter, 'execute_sql')
+    @patch("shutil.which", return_value=True)
+    @patch("tempfile.TemporaryDirectory")
+    @patch("tarfile.open")
+    @patch("subprocess.run")
+    @patch.object(PostgresAdapter, "execute_sql")
     def test_run_pg_restore_without_table_list(
-        self, mock_execute_sql, mock_subprocess_run, mock_tarfile_open, mock_temp_dir, mock_shutil_which
+        self,
+        mock_execute_sql,
+        mock_subprocess_run,
+        mock_tarfile_open,
+        mock_temp_dir,
+        mock_shutil_which,
     ):
         """
         Tests that _run_pg_restore does NOT add --table arguments when table_list is None.
         """
-        mock_temp_dir.return_value.__enter__.return_value = '/fake/temp/dir'
+        mock_temp_dir.return_value.__enter__.return_value = "/fake/temp/dir"
 
         # Mock the Path object's behavior.
         mock_path_instance = MagicMock()
@@ -82,7 +94,9 @@ class TestPostgresAdapterUnit(unittest.TestCase):
         mock_dir_in_list.is_dir.return_value = True
         mock_path_instance.iterdir.return_value = [mock_dir_in_list]
 
-        with patch('py_load_chembl.adapters.postgres.Path', return_value=mock_path_instance):
+        with patch(
+            "py_load_chembl.adapters.postgres.Path", return_value=mock_path_instance
+        ):
             adapter = PostgresAdapter("postgresql://user:pass@host/db")
             dump_path = Path("/fake/dump.tar.gz")
 
