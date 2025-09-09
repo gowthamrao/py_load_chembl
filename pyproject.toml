@@ -1,8 +1,8 @@
 [tool.poetry]
-name = "py-load-chembl"
+name = "py_load_chembl"
 version = "0.1.0"
 description = "A Python package for loading the ChEMBL database into various relational database systems."
-authors = ["Gowtham Rao <rao@ohdsi.org>"]
+authors = ["Gowtham Rao rao@ohdsi.org"]
 license = "Apache-2.0"
 readme = "README.md"
 
