@@ -246,7 +246,7 @@ class PostgresAdapter(DatabaseAdapter):
                 logger.info("No active entities became obsolete in this update.")
 
             return obsolete_count
-        except psycopg2.Error as e:
+        except RuntimeError as e:
             # This can happen if chembl_id_lookup table doesn't exist, which is fine on first load
             if "does not exist" in str(e):
                 logger.warning(
@@ -368,6 +368,18 @@ class PostgresAdapter(DatabaseAdapter):
         """
         results = self.execute_sql(sql, (schema, table_name), fetch="all")
         return [row[0] for row in results]
+
+    def create_table_from_schema(
+        self, source_schema: str, target_schema: str, table_name: str
+    ) -> None:
+        """
+        Creates a new table in the target schema with the same schema as the source table
+        using PostgreSQL's 'LIKE' syntax.
+        """
+        logger.info(f"Creating table '{target_schema}.{table_name}' like '{source_schema}.{table_name}'...")
+        sql = f'CREATE TABLE "{target_schema}"."{table_name}" (LIKE "{source_schema}"."{table_name}" INCLUDING ALL);'
+        self.execute_sql(sql)
+        logger.info(f"Table '{target_schema}.{table_name}' created successfully.")
 
     def get_column_definitions(
         self, schema: str, table_name: str
