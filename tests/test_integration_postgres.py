@@ -5,22 +5,14 @@ import gzip
 import hashlib
 from pathlib import Path
 import requests_mock
+import json
+import logging
 
 from py_load_chembl.pipeline import LoaderPipeline
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
 # Mark all tests in this file as integration tests
 pytestmark = pytest.mark.integration
-
-# The pytest-docker plugin handles service availability.
-# The manual check below is removed as it can fail in certain CI environments
-# where the docker socket is available but the CLI is not in the path.
-
-# @pytest.fixture(scope="module")
-# def is_docker_running():
-#     ...
-# if not is_docker_running():
-#     ...
 
 @pytest.fixture(scope="module")
 def postgres_service(docker_ip, docker_services):
@@ -61,13 +53,12 @@ def is_postgres_ready(host, port, user, password, dbname):
         return False
 
 
-def test_postgres_full_load(postgres_service, tmp_path, requests_mock):
+def test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog):
     """
     Tests the end-to-end FULL load process against a containerized PostgreSQL.
-    NOTE: The original test used a .tar.gz file that was not a valid pg_restore archive.
-    This has been corrected to use a valid .sql.gz file, which aligns with the
-    adapter's psql restore path.
+    This test now also verifies that structured logging is working correctly.
     """
+    caplog.set_level(logging.INFO)
     # --- 1. Setup test data paths and mock URLs ---
     test_data_dir = Path(__file__).parent / "test_data"
     test_sql_path = test_data_dir / "chembl_xx_postgresql" / "chembl_xx.sql"
@@ -132,12 +123,33 @@ def test_postgres_full_load(postgres_service, tmp_path, requests_mock):
             chembl_id, pref_name = cursor.fetchone()
             assert chembl_id == "CHEMBL1"
             assert pref_name == "ASPIRIN"
+
+        # --- 5. Assert logging ---
+        log_records = [json.loads(rec) for rec in caplog.text.strip().split('\n') if rec]
+
+        # Check for a log from the pipeline
+        pipeline_start_log = next((rec for rec in log_records if "Starting ChEMBL load" in rec["message"]), None)
+        assert pipeline_start_log is not None
+        assert pipeline_start_log["level"] == "INFO"
+        assert pipeline_start_log["name"] == "py_load_chembl.pipeline"
+
+        # Check for a log from the adapter
+        adapter_log = next((rec for rec in log_records if "Schema-specific restore completed" in rec["message"]), None)
+        assert adapter_log is not None
+        assert adapter_log["level"] == "INFO"
+        assert adapter_log["name"] == "py_load_chembl.adapters.postgres"
+
+        # Check for a database logging message
+        db_log = next((rec for rec in log_records if "Logging to database with load_id" in rec["message"]), None)
+        assert db_log is not None
+        assert db_log["level"] == "INFO"
+
     finally:
         if conn:
             conn.close()
 
 
-def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock):
+def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock, caplog):
     """
     Tests the new, robust delta load workflow.
     1. Runs a full load to establish an initial "production" state.
@@ -148,7 +160,7 @@ def test_postgres_delta_load_workflow(postgres_service, tmp_path, requests_mock)
     """
     # --- 1. Setup: Run a FULL load to create the initial state ---
     # This uses the exact same logic and mocks as the full_load test
-    test_postgres_full_load(postgres_service, tmp_path, requests_mock)
+    test_postgres_full_load(postgres_service, tmp_path, requests_mock, caplog)
 
     # --- 2. Setup: Manually alter a record in the "production" database ---
     conn = psycopg2.connect(postgres_service["uri"])

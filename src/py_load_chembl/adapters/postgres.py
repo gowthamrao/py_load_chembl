@@ -4,12 +4,15 @@ import subprocess
 import tarfile
 import tempfile
 import gzip
+import logging
 from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 import psycopg2
 from py_load_chembl.adapters.base import DatabaseAdapter
+
+logger = logging.getLogger(__name__)
 
 
 class PostgresAdapter(DatabaseAdapter):
@@ -46,7 +49,7 @@ class PostgresAdapter(DatabaseAdapter):
 
     def create_metadata_tables(self) -> None:
         """Creates the metadata tracking tables if they don't exist."""
-        print("Ensuring metadata tables exist...")
+        logger.info("Ensuring metadata tables exist...")
         meta_schema = "chembl_loader_meta"
         schema_ddl = f"CREATE SCHEMA IF NOT EXISTS {meta_schema};"
 
@@ -77,13 +80,13 @@ class PostgresAdapter(DatabaseAdapter):
         self.execute_sql(schema_ddl)
         self.execute_sql(history_ddl)
         self.execute_sql(details_ddl)
-        print("Metadata tables are ready.")
+        logger.info("Metadata tables are ready.")
 
     def execute_ddl(self, ddl_script: str) -> None:
         """Executes a DDL script (e.g., schema creation, index management)."""
-        print(f"Executing DDL...")
+        logger.info("Executing DDL...")
         self.execute_sql(ddl_script)
-        print("DDL execution complete.")
+        logger.info("DDL execution complete.")
 
     def bulk_load_table(
         self, table_name: str, data_source: Path | str, schema: str = "public", options: Dict[str, Any] = {}
@@ -96,23 +99,22 @@ class PostgresAdapter(DatabaseAdapter):
         """
         data_source_path = Path(data_source)
         if data_source_path.name.endswith(".sql.gz"):
-            print(f"Initiating schema-specific restore from '{data_source_path}' using psql...")
+            logger.info(f"Initiating schema-specific restore from '{data_source_path}' using psql...")
             self._run_psql_restore(data_source_path, schema=schema)
-            print("Schema-specific restore completed.")
+            logger.info("Schema-specific restore completed.")
         elif data_source_path.name.endswith(".tar.gz"):
-            print(f"Initiating full database restore from '{data_source_path}' into schema '{schema}'...")
+            logger.info(f"Initiating full database restore from '{data_source_path}' into schema '{schema}'...")
             self._run_pg_restore(data_source_path, schema=schema)
-            print("Database restore completed.")
+            logger.info("Database restore completed.")
         elif data_source_path.name.endswith(".tsv"):
-            print(f"Initiating COPY load into '{schema}.{table_name}' from '{data_source_path}'...")
+            logger.info(f"Initiating COPY load into '{schema}.{table_name}' from '{data_source_path}'...")
             conn = self.connect()
             sql = f"COPY {schema}.{table_name} FROM STDIN WITH (FORMAT text, DELIMITER E'\\t', NULL 'None')"
             try:
                 with conn.cursor() as cursor, open(data_source_path, 'r', encoding='utf-8') as f:
-                    # Using copy_expert to allow for dynamic table/schema names
                     cursor.copy_expert(sql, f)
                 conn.commit()
-                print("COPY load completed.")
+                logger.info("COPY load completed.")
             except psycopg2.Error as e:
                 conn.rollback()
                 raise RuntimeError(f"Failed to COPY data into {schema}.{table_name}: {e}") from e
@@ -126,15 +128,19 @@ class PostgresAdapter(DatabaseAdapter):
 
         Returns a dictionary with 'inserted' and 'updated' counts.
         """
-        print(f"Merging data from '{source_table}' into '{target_table}'...")
+        logger.info(f"Merging data from '{source_table}' into '{target_table}'...")
         non_pk_columns = [col for col in all_columns if col not in primary_keys]
 
         if not non_pk_columns:
-            raise ValueError("The `all_columns` list must contain columns other than the primary keys for updating.")
+            # This case can happen for tables that are pure link tables (e.g., two columns, both are PKs)
+            logger.warning(f"Table {target_table} has no non-primary-key columns to update. Skipping update clause.")
+            update_clause = "NOTHING"
+        else:
+            update_clause = "UPDATE SET " + ", ".join(f"{col} = EXCLUDED.{col}" for col in non_pk_columns)
 
-        conflict_target = ", ".join(primary_keys)
-        update_clause = ", ".join(f"{col} = EXCLUDED.{col}" for col in non_pk_columns)
-        column_list = ", ".join(all_columns)
+
+        conflict_target = ", ".join(f'"{col}"' for col in primary_keys)
+        column_list = ", ".join(f'"{col}"' for col in all_columns)
 
         # The 'xmax = 0' is a PostgreSQL system column trick.
         # xmax is 0 for a newly inserted row. For an updated row, it's non-zero.
@@ -143,8 +149,7 @@ class PostgresAdapter(DatabaseAdapter):
         WITH results AS (
             INSERT INTO {target_table} ({column_list})
             SELECT {column_list} FROM {source_table}
-            ON CONFLICT ({conflict_target}) DO UPDATE
-            SET {update_clause}
+            ON CONFLICT ({conflict_target}) DO {update_clause}
             RETURNING xmax = 0 AS is_insert
         )
         SELECT
@@ -154,15 +159,11 @@ class PostgresAdapter(DatabaseAdapter):
         """
 
         result = self.execute_sql(sql, fetch='one')
-        total_rows, inserted_count = result[0], result[1]
-
-        # Handle case where no rows are processed
-        if total_rows is None:
-            total_rows, inserted_count = 0, 0
+        total_rows, inserted_count = (result[0] or 0), (result[1] or 0)
 
         updated_count = total_rows - inserted_count
 
-        print(f"Merge complete. Inserted: {inserted_count}, Updated: {updated_count}")
+        logger.info(f"Merge complete. Inserted: {inserted_count}, Updated: {updated_count}")
         return {"inserted": inserted_count, "updated": updated_count}
 
     def optimize_pre_load(self, schema: str) -> None:
@@ -172,14 +173,14 @@ class PostgresAdapter(DatabaseAdapter):
 
     def optimize_post_load(self, schema: str) -> None:
         """Re-enables constraints, rebuilds indexes, and runs statistics gathering (e.g., ANALYZE)."""
-        print("Optimizing database post-load: Running ANALYZE...")
+        logger.info("Optimizing database post-load: Running ANALYZE...")
         conn = self.connect()
         # Autocommit mode to run ANALYZE outside a transaction block
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         try:
             with conn.cursor() as cursor:
                 cursor.execute("ANALYZE VERBOSE;")
-            print("ANALYZE command completed successfully.")
+            logger.info("ANALYZE command completed successfully.")
         except psycopg2.Error as e:
             raise RuntimeError(f"Failed to run ANALYZE on the database: {e}") from e
         finally:
@@ -189,14 +190,14 @@ class PostgresAdapter(DatabaseAdapter):
 
     def clean_schema(self, schema: str) -> None:
         """Drops and recreates a schema."""
-        print(f"Cleaning schema '{schema}'...")
+        logger.info(f"Cleaning schema '{schema}'...")
         self.execute_sql(f"DROP SCHEMA IF EXISTS {schema} CASCADE;")
         self.execute_sql(f"CREATE SCHEMA {schema};")
-        print(f"Schema '{schema}' has been reset.")
+        logger.info(f"Schema '{schema}' has been reset.")
 
     def get_table_names(self, schema: str) -> List[str]:
         """Returns a list of table names in a given schema."""
-        print(f"Fetching table names from schema '{schema}'...")
+        logger.debug(f"Fetching table names from schema '{schema}'...")
         sql = """
             SELECT table_name
             FROM information_schema.tables
@@ -208,7 +209,7 @@ class PostgresAdapter(DatabaseAdapter):
 
     def get_column_names(self, schema: str, table_name: str) -> List[str]:
         """Returns a list of column names for a given table in a schema."""
-        print(f"Fetching column names for '{schema}.{table_name}'...")
+        logger.debug(f"Fetching column names for '{schema}.{table_name}'...")
         sql = """
             SELECT column_name
             FROM information_schema.columns
@@ -223,7 +224,7 @@ class PostgresAdapter(DatabaseAdapter):
         Compares the schema of a source and target table. If the target table does not exist,
         it is created. If it exists, additive changes (new columns) are applied.
         """
-        print(f"Comparing schema for table '{target_table_name}'...")
+        logger.info(f"Comparing schema for table '{target_table_name}'...")
 
         # Check if target table exists
         table_exists_sql = "SELECT to_regclass(%s);"
@@ -232,36 +233,28 @@ class PostgresAdapter(DatabaseAdapter):
 
         if result[0] is None:
             # Target table does not exist, so create it based on the source table's structure
-            print(f"Target table '{target_table_regclass}' does not exist. Creating it now.")
+            logger.info(f"Target table '{target_table_regclass}' does not exist. Creating it now.")
             create_sql = f'CREATE TABLE {target_table_regclass} (LIKE "{source_schema}"."{source_table_name}" INCLUDING ALL);'
             self.execute_sql(create_sql)
-            print(f"Table '{target_table_regclass}' created successfully.")
+            logger.info(f"Table '{target_table_regclass}' created successfully.")
             return  # No further migration needed
 
         # --- If table exists, proceed with column comparison ---
-
-        # Get column definitions for source table
-        source_cols_sql = """
-            SELECT column_name, data_type, character_maximum_length
-            FROM information_schema.columns
-            WHERE table_schema = %s AND table_name = %s;
-        """
+        source_cols_sql = "SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
         source_cols_result = self.execute_sql(source_cols_sql, (source_schema, source_table_name), fetch='all')
         source_columns = {row[0]: {'type': row[1], 'length': row[2]} for row in source_cols_result}
 
-        # Get column names for target table
         target_cols_sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
         target_cols_result = self.execute_sql(target_cols_sql, (target_schema, target_table_name), fetch='all')
         target_columns = {row[0] for row in target_cols_result}
 
-        # Find columns that are in the source but not in the target
         new_columns = source_columns.keys() - target_columns
 
         if not new_columns:
-            print("Schemas are identical. No migration needed.")
+            logger.info("Schemas are identical. No migration needed.")
             return
 
-        print(f"Found new columns to add: {', '.join(new_columns)}")
+        logger.info(f"Found new columns to add: {', '.join(new_columns)}")
 
         for col_name in sorted(list(new_columns)):
             col_info = source_columns[col_name]
@@ -270,158 +263,105 @@ class PostgresAdapter(DatabaseAdapter):
                 data_type = f"{data_type}({col_info['length']})"
 
             alter_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN "{col_name}" {data_type};'
-            print(f"Applying schema change: {alter_sql}")
+            logger.info(f"Applying schema change: {alter_sql}")
             self.execute_sql(alter_sql)
 
-        print(f"Successfully migrated schema for table '{target_table_name}'.")
+        logger.info(f"Successfully migrated schema for table '{target_table_name}'.")
 
     def _run_psql_restore(self, dump_archive_path: Path, schema: str):
         """
         Decompresses a .sql.gz dump and loads it into a specific schema using psql.
-        This is used for delta loads to load data into a staging schema.
+        This version redirects stdout/stderr to temp files to avoid I/O deadlocks.
         """
         if not shutil.which("psql"):
-            raise FileNotFoundError(
-                "'psql' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
-            )
+            raise FileNotFoundError("'psql' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH.")
 
-        print(f"Initiating PSQL restore from '{dump_archive_path}' into schema '{schema}'...")
-
-        # Prepare the environment for psql
+        logger.info(f"Initiating PSQL restore from '{dump_archive_path}' into schema '{schema}'...")
         env = os.environ.copy()
-        env["PGHOST"] = self._parsed_uri.hostname or "localhost"
-        env["PGPORT"] = str(self._parsed_uri.port or 5432)
-        env["PGUSER"] = self._parsed_uri.username or ""
+        env.update({
+            "PGHOST": self._parsed_uri.hostname or "localhost",
+            "PGPORT": str(self._parsed_uri.port or 5432),
+            "PGUSER": self._parsed_uri.username or "",
+        })
         if self._parsed_uri.password:
             env["PGPASSWORD"] = self._parsed_uri.password
 
-        # Create the target schema before running psql
         self.execute_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
-
-        command = [
-            "psql",
-            f"--dbname={self._parsed_uri.path.lstrip('/')}",
-            "--quiet",  # Suppress informational messages
-            "--no-psqlrc",  # Do not read psqlrc file
-            "--single-transaction",  # Run the entire script in a single transaction
-            "-v", "ON_ERROR_STOP=1",  # Exit on error
-        ]
+        command = ["psql", f"--dbname={self._parsed_uri.path.lstrip('/')}", "--quiet", "--no-psqlrc", "--single-transaction", "-v", "ON_ERROR_STOP=1"]
 
         try:
-            # Decompress the entire file into memory. This is safer for subprocess handling
-            # and ChEMBL SQL files, while large, should be manageable for this operation.
             with gzip.open(dump_archive_path, 'rt', encoding='utf-8') as f:
                 sql_content = f.read()
 
-            # Prepend the command to set the schema for this session.
-            # All tables/indexes/etc. in the script will be created in the target schema.
             full_script = f'SET search_path = "{schema}", public;\n{sql_content}'
 
-            # Use subprocess.run and pass the entire script via stdin.
-            # This is a more robust way to handle process I/O than manual piping.
-            process = subprocess.run(
-                command,
-                input=full_script,
-                capture_output=True,
-                text=True,
-                check=False,  # We will check the return code manually
-                env=env,
-            )
+            with tempfile.TemporaryFile(mode="w+") as stdout_f, tempfile.TemporaryFile(mode="w+") as stderr_f:
+                process = subprocess.run(command, input=full_script, text=True, env=env, stdout=stdout_f, stderr=stderr_f)
 
-            if process.returncode != 0:
-                error_message = (
-                    f"psql failed with exit code {process.returncode}.\n"
-                    f"--- STDOUT ---\n{process.stdout}\n"
-                    f"--- STDERR ---\n{process.stderr}"
-                )
-                raise RuntimeError(error_message)
+                if process.returncode != 0:
+                    stdout_f.seek(0)
+                    stderr_f.seek(0)
+                    stdout = stdout_f.read()
+                    stderr = stderr_f.read()
+                    logger.error(f"psql failed with exit code {process.returncode}", extra={"stdout": stdout, "stderr": stderr})
+                    raise RuntimeError(f"psql failed. See logs for details.")
 
-            print(f"Successfully loaded dump into schema '{schema}'.")
-
+            logger.info(f"Successfully loaded dump into schema '{schema}'.")
         except FileNotFoundError:
-            raise RuntimeError(
-                f"psql command not found. Make sure PostgreSQL client tools are installed and in your PATH."
-            )
+            raise RuntimeError("psql command not found. Make sure PostgreSQL client tools are installed and in your PATH.")
         except Exception as e:
-            # Catch other potential errors during process execution
             raise RuntimeError(f"An error occurred during psql execution: {e}") from e
 
     def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None):
         """
-        Extracts the dump and runs the pg_restore command.
-        If a schema is provided, it restores into that schema.
+        Extracts the dump and runs pg_restore, redirecting output to temp files
+        to avoid I/O deadlocks from large amounts of output.
         """
         if not shutil.which("pg_restore"):
-            raise FileNotFoundError(
-                "'pg_restore' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
-            )
+            raise FileNotFoundError("'pg_restore' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH.")
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            print(f"Extracting '{dump_archive_path.name}' to a temporary directory...")
+            logger.info(f"Extracting '{dump_archive_path.name}' to a temporary directory...")
             try:
                 with tarfile.open(dump_archive_path, "r:gz") as tar:
                     tar.extractall(path=tmpdir)
             except tarfile.TarError as e:
                 raise IOError(f"Failed to extract tar.gz file: {e}") from e
 
-            # The archive contains a single directory, e.g., 'chembl_33_postgresql'
-            # This directory contains the actual dump files for pg_restore.
             extracted_dirs = [d for d in Path(tmpdir).iterdir() if d.is_dir()]
             if not extracted_dirs:
                 raise FileNotFoundError("No directory found in the extracted ChEMBL archive.")
             dump_dir = extracted_dirs[0]
 
-            # Use a high number of jobs for parallel processing, let pg_restore manage it.
-            # FRD recommends using -j flag. os.cpu_count() is a sensible default.
             jobs = os.cpu_count() or 4
-
-            command = [
-                "pg_restore",
-                "--verbose",
-                "--exit-on-error",
-                f"--dbname={self._parsed_uri.path.lstrip('/')}",
-                f"--jobs={jobs}",
-                "--no-owner",      # Often desirable when restoring to a different system
-                "--no-privileges", # ACLs are often environment-specific
-            ]
-            # If a schema is specified, create it and add the --schema flag to pg_restore
+            command = ["pg_restore", "--exit-on-error", f"--dbname={self._parsed_uri.path.lstrip('/')}", f"--jobs={jobs}", "--no-owner", "--no-privileges"]
             if schema:
                 self.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {schema};")
                 command.append(f"--schema={schema}")
-
             command.append(str(dump_dir))
 
             env = os.environ.copy()
-            env["PGHOST"] = self._parsed_uri.hostname or "localhost"
-            env["PGPORT"] = str(self._parsed_uri.port or 5432)
-            env["PGUSER"] = self._parsed_uri.username or ""
+            env.update({
+                "PGHOST": self._parsed_uri.hostname or "localhost",
+                "PGPORT": str(self._parsed_uri.port or 5432),
+                "PGUSER": self._parsed_uri.username or "",
+            })
             if self._parsed_uri.password:
                 env["PGPASSWORD"] = self._parsed_uri.password
 
-            print(f"Running pg_restore with {jobs} parallel jobs...")
+            logger.info(f"Running pg_restore with {jobs} parallel jobs...")
             try:
-                process = subprocess.run(
-                    command,
-                    capture_output=True,
-                    text=True,
-                    check=True, # Raises CalledProcessError on non-zero exit codes
-                    env=env,
-                )
-                print("--- pg_restore STDOUT ---")
-                print(process.stdout)
-                if process.stderr:
-                    print("--- pg_restore STDERR ---")
-                    print(process.stderr)
+                with tempfile.TemporaryFile(mode="w+") as stdout_f, tempfile.TemporaryFile(mode="w+") as stderr_f:
+                    process = subprocess.run(command, text=True, env=env, stdout=stdout_f, stderr=stderr_f)
 
+                    if process.returncode != 0:
+                        stdout_f.seek(0)
+                        stderr_f.seek(0)
+                        stdout = stdout_f.read()
+                        stderr = stderr_f.read()
+                        logger.error(f"pg_restore failed with exit code {process.returncode}", extra={"stdout": stdout, "stderr": stderr})
+                        raise RuntimeError(f"pg_restore failed. See logs for details.")
             except FileNotFoundError:
-                raise RuntimeError(
-                    f"pg_restore command not found. Make sure PostgreSQL client tools are installed and in your PATH."
-                )
-            except subprocess.CalledProcessError as e:
-                error_message = (
-                    f"pg_restore failed with exit code {e.returncode}.\n"
-                    f"Ensure the target database '{self._parsed_uri.path.lstrip('/')}' exists and is empty.\n"
-                    f"--- STDOUT ---\n{e.stdout}\n"
-                    f"--- STDERR ---\n{e.stderr}"
-                )
-                raise RuntimeError(error_message) from e
+                raise RuntimeError("pg_restore command not found. Make sure PostgreSQL client tools are installed and in your PATH.")
+            except Exception as e:
+                 raise RuntimeError(f"An error occurred during pg_restore execution: {e}") from e
