@@ -8,3 +8,5 @@ CREATE TABLE molecule_dictionary (
 
 INSERT INTO molecule_dictionary VALUES (1, 'CHEMBL1', 'ASPIRIN', 'Small Molecule');
 INSERT INTO molecule_dictionary VALUES (2, 'CHEMBL2', 'IBUPROFEN', 'Small Molecule');
+
+ALTER TABLE ONLY molecule_dictionary ADD CONSTRAINT molecule_dictionary_pkey PRIMARY KEY (molregno);
