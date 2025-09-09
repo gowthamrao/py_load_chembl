@@ -22,6 +22,8 @@ class PostgresAdapter(DatabaseAdapter):
         self.connection_string = connection_string
         self.conn = None
         self._parsed_uri = urlparse(self.connection_string)
+        self.managed_constraints: List[Dict[str, str]] = []
+        self.managed_indexes: List[str] = []
 
     def connect(self) -> Any:
         """Establishes a connection to the target database."""
@@ -215,19 +217,77 @@ class PostgresAdapter(DatabaseAdapter):
         return obsolete_count
 
     def optimize_pre_load(self, schema: str) -> None:
-        """Disables constraints and indexes before a full load."""
-        # pg_restore handles this by default (data is loaded first, then indexes/constraints are created)
-        pass
+        """
+        Disables constraints and indexes before a full load by capturing their
+        definitions and then dropping them.
+        """
+        logger.info(f"--- Optimizing schema '{schema}' for pre-load ---")
+
+        # 1. Get definitions
+        self.managed_constraints = self._get_schema_constraints(schema)
+        self.managed_indexes = self._get_schema_indexes(schema)
+
+        # 2. Drop constraints
+        if self.managed_constraints:
+            logger.info(f"Dropping {len(self.managed_constraints)} foreign key constraints...")
+            for constraint in self.managed_constraints:
+                sql = f"ALTER TABLE {constraint['table']} DROP CONSTRAINT IF EXISTS {constraint['name']};"
+                self.execute_sql(sql)
+            logger.info("Finished dropping constraints.")
+        else:
+            logger.info("No foreign key constraints to drop.")
+
+        # 3. Drop indexes
+        if self.managed_indexes:
+            logger.info(f"Dropping {len(self.managed_indexes)} indexes...")
+            # The DDL from _get_schema_indexes is a CREATE statement, we need to parse the index name
+            for index_ddl in self.managed_indexes:
+                try:
+                    # A bit of parsing to robustly get the index name
+                    index_name = index_ddl.split(" ON ")[0].split("INDEX ")[1]
+                    if "." in index_name:
+                        # The name might be schema-qualified
+                        _, index_name = index_name.split(".")
+                    sql = f'DROP INDEX IF EXISTS "{schema}"."{index_name}";'
+                    self.execute_sql(sql)
+                except IndexError:
+                    logger.warning(f"Could not parse index name from DDL: {index_ddl}")
+            logger.info("Finished dropping indexes.")
+        else:
+            logger.info("No indexes to drop.")
 
     def optimize_post_load(self, schema: str) -> None:
-        """Re-enables constraints, rebuilds indexes, and runs statistics gathering (e.g., ANALYZE)."""
+        """
+        Re-enables constraints, rebuilds indexes, and runs statistics gathering (e.g., ANALYZE).
+        """
+        logger.info(f"--- Optimizing schema '{schema}' for post-load ---")
+
+        # 1. Recreate constraints
+        if self.managed_constraints:
+            logger.info(f"Recreating {len(self.managed_constraints)} foreign key constraints...")
+            for constraint in self.managed_constraints:
+                self.execute_sql(constraint['ddl'])
+            logger.info("Finished recreating constraints.")
+        else:
+            logger.info("No managed foreign key constraints to recreate.")
+
+        # 2. Recreate indexes
+        if self.managed_indexes:
+            logger.info(f"Recreating {len(self.managed_indexes)} indexes...")
+            for index_ddl in self.managed_indexes:
+                self.execute_sql(index_ddl)
+            logger.info("Finished recreating indexes.")
+        else:
+            logger.info("No managed indexes to recreate.")
+
+        # 3. Run ANALYZE
         logger.info("Optimizing database post-load: Running ANALYZE...")
         conn = self.connect()
         # Autocommit mode to run ANALYZE outside a transaction block
         conn.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
         try:
             with conn.cursor() as cursor:
-                cursor.execute("ANALYZE VERBOSE;")
+                cursor.execute(f"ANALYZE VERBOSE;")
             logger.info("ANALYZE command completed successfully.")
         except psycopg2.Error as e:
             raise RuntimeError(f"Failed to run ANALYZE on the database: {e}") from e
@@ -369,6 +429,62 @@ class PostgresAdapter(DatabaseAdapter):
             raise RuntimeError("psql command not found. Make sure PostgreSQL client tools are installed and in your PATH.")
         except Exception as e:
             raise RuntimeError(f"An error occurred during psql execution: {e}") from e
+
+    def _get_schema_constraints(self, schema: str) -> List[Dict[str, str]]:
+        """
+        Retrieves all foreign key constraints for a given schema.
+        """
+        logger.info(f"Retrieving foreign key constraints for schema '{schema}'...")
+        sql = """
+            SELECT
+                conrelid::regclass AS table_name,
+                conname AS constraint_name,
+                pg_get_constraintdef(c.oid) AS constraint_ddl
+            FROM
+                pg_constraint c
+            JOIN
+                pg_namespace ns ON ns.oid = c.connamespace
+            WHERE
+                ns.nspname = %s AND c.contype = 'f'
+            ORDER BY
+                conrelid::regclass::text, conname;
+        """
+        results = self.execute_sql(sql, (schema,), fetch='all')
+        constraints = [
+            {"table": row[0], "name": row[1], "ddl": f"ALTER TABLE {row[0]} ADD CONSTRAINT {row[1]} {row[2]}"}
+            for row in results
+        ]
+        logger.info(f"Found {len(constraints)} foreign key constraints.")
+        return constraints
+
+    def _get_schema_indexes(self, schema: str) -> List[str]:
+        """
+        Retrieves all non-primary key, non-unique constraint indexes for a given schema.
+        """
+        logger.info(f"Retrieving indexes for schema '{schema}'...")
+        # This query is designed to find all indexes that are NOT backing a constraint
+        # (like PRIMARY KEY or UNIQUE constraints), as those are handled separately.
+        sql = """
+            SELECT
+                'CREATE ' || pg_get_indexdef(i.indexrelid) AS index_ddl
+            FROM
+                pg_index i
+            JOIN
+                pg_class c ON c.oid = i.indexrelid
+            JOIN
+                pg_namespace ns ON ns.oid = c.relnamespace
+            WHERE
+                ns.nspname = %s
+                AND i.indisprimary = false
+                AND i.indisunique = false
+                AND i.indisvalid = true
+            ORDER BY
+                c.relname;
+        """
+        results = self.execute_sql(sql, (schema,), fetch='all')
+        indexes = [row[0] for row in results]
+        logger.info(f"Found {len(indexes)} indexes to manage.")
+        return indexes
 
     def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None, table_list: List[str] | None = None):
         """
