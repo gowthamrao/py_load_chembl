@@ -94,37 +94,15 @@ class LoaderPipeline:
         # For DELTA mode, we need the plain SQL dump to load into a staging schema.
         # For FULL mode, the custom .tar.gz format is faster with pg_restore.
         use_plain_sql = self.mode == "DELTA"
-        dump_url, checksums_url = downloader.get_chembl_file_urls(
-            self.chembl_version, plain_sql=use_plain_sql
+
+        # The download_chembl_db function now handles the entire download and
+        # verification workflow, including raising an error on checksum mismatch.
+        self.pg_dump_path = downloader.download_chembl_db(
+            version=self.chembl_version,
+            output_dir=self.output_dir,
+            plain_sql=use_plain_sql,
         )
-
-        logger.info(f"Requesting ChEMBL dump from: {dump_url}")
-        # Check if file already exists and is valid before downloading
-        local_file = self.output_dir / dump_url.split("/")[-1]
-        if local_file.exists():
-            logger.info(
-                f"File '{local_file.name}' already exists. Verifying checksum..."
-            )
-            if downloader.verify_checksum(local_file, checksums_url):
-                logger.info("Checksum is valid. Skipping download.")
-                self.pg_dump_path = local_file
-                return
-            else:
-                logger.warning("Checksum is invalid. Re-downloading the file.")
-
-        downloaded_file = downloader.download_file(dump_url, self.output_dir)
-
-        logger.info("Verifying file integrity...")
-        is_valid = downloader.verify_checksum(downloaded_file, checksums_url)
-
-        if not is_valid:
-            raise ValueError(
-                f"Checksum for {downloaded_file.name} is invalid. "
-                "The file may be corrupted. Please delete it and try again."
-            )
-
-        self.pg_dump_path = downloaded_file
-        logger.info("Checksum verified successfully.")
+        logger.info("Acquisition complete. Data is downloaded and verified.")
 
     def _execute_full_load(self):
         """Handles the full data load stage."""

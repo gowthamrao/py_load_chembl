@@ -1,6 +1,6 @@
 import hashlib
-import re
 import logging
+import re
 from pathlib import Path
 from typing import Tuple
 
@@ -18,6 +18,58 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases"
 
 
+class ChecksumError(ValueError):
+    """Custom exception for checksum validation errors."""
+
+
+def download_chembl_db(
+    version: int, output_dir: Path, plain_sql: bool = False
+) -> Path:
+    """
+    Downloads the ChEMBL database dump for a specific version and verifies its integrity.
+
+    This is the main public function for this module. It orchestrates the download
+    and checksum verification process.
+
+    Args:
+        version: The ChEMBL version number to download.
+        output_dir: The directory where the file will be saved.
+        plain_sql: If True, downloads the plain-text SQL dump. Otherwise, downloads
+                   the pg_restore custom format archive.
+
+    Returns:
+        The path to the downloaded and verified file.
+
+    Raises:
+        ChecksumError: If the downloaded file's checksum does not match the official one.
+    """
+    logger.info(
+        f"Starting download and verification for ChEMBL v{version} (plain_sql={plain_sql})."
+    )
+    dump_url, checksums_url = get_chembl_file_urls(version, plain_sql=plain_sql)
+
+    downloaded_file_path = download_file(dump_url, output_dir)
+
+    try:
+        is_valid = verify_checksum(downloaded_file_path, checksums_url)
+        if not is_valid:
+            logger.error(
+                f"Checksum validation failed for {downloaded_file_path.name}. Deleting corrupted file."
+            )
+            downloaded_file_path.unlink()  # Delete the corrupted file
+            raise ChecksumError(
+                f"Checksum for {downloaded_file_path.name} is invalid. The file has been deleted."
+            )
+    except Exception:
+        # If anything goes wrong during verification, clean up the downloaded file
+        if downloaded_file_path.exists():
+            downloaded_file_path.unlink()
+        raise
+
+    logger.info(f"Successfully downloaded and verified {downloaded_file_path.name}.")
+    return downloaded_file_path
+
+
 def get_latest_chembl_version() -> int:
     """
     Finds the latest ChEMBL version number from the EBI FTP server.
@@ -29,7 +81,6 @@ def get_latest_chembl_version() -> int:
     except requests.RequestException as e:
         raise ConnectionError(f"Could not connect to ChEMBL FTP server: {e}") from e
 
-    # Find all directory names like 'chembl_33/' in href attributes
     dir_names = re.findall(r'href="chembl_(\d+)/"', response.text)
     if not dir_names:
         raise ValueError("Could not find any ChEMBL versions in the FTP directory.")
@@ -39,21 +90,14 @@ def get_latest_chembl_version() -> int:
     return latest_version
 
 
-def get_chembl_file_urls(version: int, plain_sql: bool = True) -> Tuple[str, str]:
+def get_chembl_file_urls(version: int, plain_sql: bool = False) -> Tuple[str, str]:
     """
     Constructs the URLs for the PostgreSQL dump and checksums file for a given version.
-
-    Args:
-        version: The ChEMBL version number.
-        plain_sql: If True, returns the URL for the plain-text SQL dump (.sql.gz).
-                   Otherwise, returns the URL for the custom-format dump (.tar.gz).
     """
     version_url = f"{BASE_URL}/chembl_{version}"
     if plain_sql:
-        # For delta loads, we prefer the plain SQL dump to manipulate it for staging.
         dump_url = f"{version_url}/chembl_{version}_postgresql.sql.gz"
     else:
-        # For full loads, the pg_restore format can be faster.
         dump_url = f"{version_url}/chembl_{version}_postgresql.tar.gz"
     checksums_url = f"{version_url}/checksums.txt"
     return dump_url, checksums_url
@@ -83,6 +127,16 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
 
     try:
         with requests.get(url, stream=True, headers=headers, timeout=60) as r:
+            # Check if the server supports range requests for resuming
+            if r.status_code == 206:
+                logger.info("Server supports resume.")
+            elif initial_size > 0:
+                logger.warning(
+                    "Server does not support resume. Restarting download from scratch."
+                )
+                initial_size = 0
+                file_mode = "wb"
+
             r.raise_for_status()
             total_size = int(r.headers.get("content-length", 0)) + initial_size
 
@@ -100,7 +154,7 @@ def download_file(url: str, output_dir: Path, resume: bool = True) -> Path:
                 task_id = progress.add_task(
                     "download",
                     total=total_size,
-                    initial=initial_size,
+                    completed=initial_size,
                     filename=local_filename,
                 )
                 with open(local_path, file_mode) as f:
@@ -132,7 +186,6 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
 
     expected_checksum = None
     for line in checksums_text.splitlines():
-        # Line format: <MD5_hash>  <filename>
         parts = line.split()
         if len(parts) == 2 and parts[1] == file_path.name:
             expected_checksum = parts[0]
@@ -152,21 +205,15 @@ def verify_checksum(file_path: Path, checksums_url: str) -> bool:
     is_valid = actual_checksum == expected_checksum
     if is_valid:
         logger.info(
-            "Checksum valid.",
-            extra={
-                "file": file_path.name,
-                "expected": expected_checksum,
-                "actual": actual_checksum,
-            },
+            "Checksum valid for %s.",
+            file_path.name,
+            extra={"expected": expected_checksum, "actual": actual_checksum},
         )
     else:
         logger.warning(
-            "Checksum invalid.",
-            extra={
-                "file": file_path.name,
-                "expected": expected_checksum,
-                "actual": actual_checksum,
-            },
+            "Checksum invalid for %s.",
+            file_path.name,
+            extra={"expected": expected_checksum, "actual": actual_checksum},
         )
 
     return is_valid
