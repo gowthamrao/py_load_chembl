@@ -51,6 +51,13 @@ def load(
     ] = "FULL",
     version: VersionOption = "latest",
     output_dir: OutputDirOption = Path("./chembl_data"),
+    include_tables: Annotated[
+        str,
+        typer.Option(
+            "--include-tables",
+            help="Comma-separated list of tables to load (e.g., 'molecule_dictionary,compound_structures'). If not provided, all tables are loaded.",
+        ),
+    ] = None,
 ):
     """
     Downloads and loads ChEMBL data into a target database.
@@ -63,8 +70,16 @@ def load(
         logger.critical("Only postgresql targets are currently supported.", extra={"target": target})
         raise typer.Exit(code=1)
 
+    table_list = include_tables.split(",") if include_tables else None
+
     adapter = PostgresAdapter(connection_string=target)
-    pipeline = LoaderPipeline(adapter=adapter, version=version, mode=mode, output_dir=output_dir)
+    pipeline = LoaderPipeline(
+        adapter=adapter,
+        version=version,
+        mode=mode,
+        output_dir=output_dir,
+        include_tables=table_list,
+    )
 
     try:
         pipeline.run()

@@ -14,7 +14,14 @@ class LoaderPipeline:
     The main pipeline for loading ChEMBL data.
     """
 
-    def __init__(self, version: str, output_dir: Path, adapter: DatabaseAdapter | None = None, mode: str | None = None):
+from typing import List
+
+class LoaderPipeline:
+    """
+    The main pipeline for loading ChEMBL data.
+    """
+
+    def __init__(self, version: str, output_dir: Path, adapter: DatabaseAdapter | None = None, mode: str | None = None, include_tables: List[str] | None = None):
         if mode is None and adapter is None:
             # This is valid for download-only mode
             pass
@@ -25,6 +32,7 @@ class LoaderPipeline:
         self.version_str = version
         self.mode = mode.upper() if mode else None
         self.output_dir = output_dir
+        self.include_tables = include_tables
         self.chembl_version = 0
         self.pg_dump_path: Path | None = None
         self.load_id: int | None = None
@@ -114,13 +122,14 @@ class LoaderPipeline:
         self.adapter.clean_schema("public")
 
         # The adapter's bulk_load_table for postgres uses pg_restore, which is a full restore.
-        # The table_name parameter is ignored in this specific implementation.
         self.adapter.bulk_load_table(
-            table_name="all",  # Parameter is ignored by pg_restore implementation
+            table_name="all",
             data_source=self.pg_dump_path,
-            schema="public",  # Explicitly restore to public schema
+            schema="public",
+            options={"include_tables": self.include_tables},
         )
-        self._log_load_details_to_db(table_name="all_tables_via_pg_restore", insert_count=-1)
+        log_table_name = f"tables: {','.join(self.include_tables)}" if self.include_tables else "all_tables"
+        self._log_load_details_to_db(table_name=log_table_name, insert_count=-1)
 
         # 3. Post-Processing Stage
         logger.info("--- Stage: Post-Processing ---")
@@ -153,8 +162,13 @@ class LoaderPipeline:
             chembl_schemas = parse_chembl_ddl(self.pg_dump_path)
 
             # 3. Get the list of tables to merge from the staging schema
-            tables_to_merge = self.adapter.get_table_names(schema=staging_schema)
-            logger.info(f"Found {len(tables_to_merge)} tables in staging schema to process.")
+            all_tables_in_staging = self.adapter.get_table_names(schema=staging_schema)
+            if self.include_tables:
+                tables_to_merge = [t for t in all_tables_in_staging if t in self.include_tables]
+                logger.info(f"Found {len(all_tables_in_staging)} total tables in staging, but will only process {len(tables_to_merge)} based on the include list.")
+            else:
+                tables_to_merge = all_tables_in_staging
+                logger.info(f"Found {len(tables_to_merge)} tables in staging schema to process.")
 
             # 4. Iterate and merge each table
             for table_name in tables_to_merge:
@@ -188,10 +202,18 @@ class LoaderPipeline:
                     all_columns=all_columns,
                 )
 
+                # 4e. Perform the soft-delete operation
+                obsolete_count = self.adapter.soft_delete_obsolete_records(
+                    source_table=f'{staging_schema}."{table_name}"',
+                    target_table=f'{target_schema}."{table_name}"',
+                    primary_keys=table_schema_info.primary_keys,
+                )
+
                 self._log_load_details_to_db(
                     table_name=table_name,
                     insert_count=merge_stats.get("inserted", 0),
                     update_count=merge_stats.get("updated", 0),
+                    obsolete_count=obsolete_count,
                 )
 
         finally:

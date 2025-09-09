@@ -104,7 +104,8 @@ class PostgresAdapter(DatabaseAdapter):
             logger.info("Schema-specific restore completed.")
         elif data_source_path.name.endswith(".tar.gz"):
             logger.info(f"Initiating full database restore from '{data_source_path}' into schema '{schema}'...")
-            self._run_pg_restore(data_source_path, schema=schema)
+            include_tables = options.get("include_tables")
+            self._run_pg_restore(data_source_path, schema=schema, table_list=include_tables)
             logger.info("Database restore completed.")
         elif data_source_path.name.endswith(".tsv"):
             logger.info(f"Initiating COPY load into '{schema}.{table_name}' from '{data_source_path}'...")
@@ -124,31 +125,41 @@ class PostgresAdapter(DatabaseAdapter):
     def execute_merge(self, source_table: str, target_table: str, primary_keys: List[str], all_columns: List[str]) -> Dict[str, int]:
         """
         Executes an efficient MERGE/UPSERT operation from source (staging) to target (production)
-        using INSERT ... ON CONFLICT.
+        using INSERT ... ON CONFLICT. This method is robust to schema differences where the
+        target table may have extra columns (like 'is_deleted').
 
         Returns a dictionary with 'inserted' and 'updated' counts.
         """
         logger.info(f"Merging data from '{source_table}' into '{target_table}'...")
-        non_pk_columns = [col for col in all_columns if col not in primary_keys]
+
+        # Introspect columns to handle schema differences gracefully
+        source_schema, source_table_name = source_table.split('.')
+        target_schema, target_table_name = target_table.split('.')
+
+        source_cols = self.get_column_names(source_schema.replace('"', ''), source_table_name.replace('"', ''))
+        target_cols = self.get_column_names(target_schema.replace('"', ''), target_table_name.replace('"', ''))
+
+        # We can only insert and update columns that exist in both tables
+        common_columns = list(set(source_cols) & set(target_cols))
+        non_pk_columns = [col for col in common_columns if col not in primary_keys]
 
         if not non_pk_columns:
-            # This case can happen for tables that are pure link tables (e.g., two columns, both are PKs)
-            logger.warning(f"Table {target_table} has no non-primary-key columns to update. Skipping update clause.")
             update_clause = "NOTHING"
         else:
-            update_clause = "UPDATE SET " + ", ".join(f"{col} = EXCLUDED.{col}" for col in non_pk_columns)
+            update_set_clause = ", ".join(f'"{col}" = EXCLUDED."{col}"' for col in non_pk_columns)
+            # Always reset the is_deleted flag on update, as the record is clearly active.
+            if 'is_deleted' in target_cols:
+                update_set_clause += ", is_deleted = FALSE"
+            update_clause = f"UPDATE SET {update_set_clause}"
 
+        conflict_target = ", ".join(f'"{pk}"' for pk in primary_keys)
+        # The columns for INSERT must only be those present in the source table
+        insert_columns = ", ".join(f'"{col}"' for col in source_cols)
 
-        conflict_target = ", ".join(f'"{col}"' for col in primary_keys)
-        column_list = ", ".join(f'"{col}"' for col in all_columns)
-
-        # The 'xmax = 0' is a PostgreSQL system column trick.
-        # xmax is 0 for a newly inserted row. For an updated row, it's non-zero.
-        # This allows us to count how many rows were inserted vs. updated.
         sql = f"""
         WITH results AS (
-            INSERT INTO {target_table} ({column_list})
-            SELECT {column_list} FROM {source_table}
+            INSERT INTO {target_table} ({insert_columns})
+            SELECT {insert_columns} FROM {source_table}
             ON CONFLICT ({conflict_target}) DO {update_clause}
             RETURNING xmax = 0 AS is_insert
         )
@@ -165,6 +176,43 @@ class PostgresAdapter(DatabaseAdapter):
 
         logger.info(f"Merge complete. Inserted: {inserted_count}, Updated: {updated_count}")
         return {"inserted": inserted_count, "updated": updated_count}
+
+    def soft_delete_obsolete_records(self, source_table: str, target_table: str, primary_keys: List[str]) -> int:
+        """
+        Marks records in the target table as deleted if they do not exist in the source table.
+        This is the "soft delete" operation.
+        Returns:
+            The number of records marked as obsolete.
+        """
+        logger.info(f"Marking obsolete records in '{target_table}'...")
+        pk_join_clause = " AND ".join(f't."{pk}" = s."{pk}"' for pk in primary_keys)
+
+        # We use a LEFT JOIN from target to source. If a source record is NULL,
+        # it means the target record is obsolete.
+        # We only update records that are not already marked as deleted.
+        sql = f"""
+        WITH obsolete_rows AS (
+            SELECT t.ctid
+            FROM {target_table} t
+            LEFT JOIN {source_table} s ON {pk_join_clause}
+            WHERE s."{primary_keys[0]}" IS NULL AND t.is_deleted = FALSE
+        )
+        UPDATE {target_table}
+        SET is_deleted = TRUE
+        WHERE ctid IN (SELECT ctid FROM obsolete_rows)
+        RETURNING 1;
+        """
+
+        # We use RETURNING to count the number of updated rows
+        results = self.execute_sql(sql, fetch='all')
+        obsolete_count = len(results)
+
+        if obsolete_count > 0:
+            logger.info(f"Marked {obsolete_count} records as obsolete in '{target_table}'.")
+        else:
+            logger.info(f"No records needed to be marked as obsolete in '{target_table}'.")
+
+        return obsolete_count
 
     def optimize_pre_load(self, schema: str) -> None:
         """Disables constraints and indexes before a full load."""
@@ -236,7 +284,10 @@ class PostgresAdapter(DatabaseAdapter):
             logger.info(f"Target table '{target_table_regclass}' does not exist. Creating it now.")
             create_sql = f'CREATE TABLE {target_table_regclass} (LIKE "{source_schema}"."{source_table_name}" INCLUDING ALL);'
             self.execute_sql(create_sql)
-            logger.info(f"Table '{target_table_regclass}' created successfully.")
+            # Also add the is_deleted column for soft-delete tracking
+            add_col_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN NOT NULL DEFAULT FALSE;'
+            self.execute_sql(add_col_sql)
+            logger.info(f"Table '{target_table_regclass}' created and prepared for loading.")
             return  # No further migration needed
 
         # --- If table exists, proceed with column comparison ---
@@ -247,6 +298,13 @@ class PostgresAdapter(DatabaseAdapter):
         target_cols_sql = "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s;"
         target_cols_result = self.execute_sql(target_cols_sql, (target_schema, target_table_name), fetch='all')
         target_columns = {row[0] for row in target_cols_result}
+
+        # Ensure the is_deleted column exists for soft deletes
+        if 'is_deleted' not in target_columns:
+            logger.info(f"Adding 'is_deleted' column to target table '{target_table_name}' for soft-delete tracking.")
+            add_col_sql = f'ALTER TABLE {target_table_regclass} ADD COLUMN is_deleted BOOLEAN NOT NULL DEFAULT FALSE;'
+            self.execute_sql(add_col_sql)
+            target_columns.add('is_deleted')
 
         new_columns = source_columns.keys() - target_columns
 
@@ -312,7 +370,7 @@ class PostgresAdapter(DatabaseAdapter):
         except Exception as e:
             raise RuntimeError(f"An error occurred during psql execution: {e}") from e
 
-    def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None):
+    def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None, table_list: List[str] | None = None):
         """
         Extracts the dump and runs pg_restore, redirecting output to temp files
         to avoid I/O deadlocks from large amounts of output.
@@ -338,6 +396,14 @@ class PostgresAdapter(DatabaseAdapter):
             if schema:
                 self.execute_sql(f"CREATE SCHEMA IF NOT EXISTS {schema};")
                 command.append(f"--schema={schema}")
+
+            if table_list:
+                logger.info(f"Will restore only the following tables: {', '.join(table_list)}")
+                for table in table_list:
+                    command.extend(["--table", table])
+            else:
+                logger.info("Will restore all tables from dump.")
+
             command.append(str(dump_dir))
 
             env = os.environ.copy()
