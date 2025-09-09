@@ -607,16 +607,28 @@ def test_full_load_standard_representation_mocked(
     # --- 2. Configure and run the pipeline ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
-    pipeline = LoaderPipeline(
-        adapter=adapter,
-        version=chembl_version,
-        mode="FULL",
-        output_dir=output_dir,
-        include_tables=STANDARD_TABLE_SUBSET,  # Use the official standard subset
-    )
-    pipeline.run()
 
-    # --- 3. Assert that pg_restore was called with the correct arguments ---
+    # This test is sensitive to test pollution from other tests that monkeypatch
+    # the LoaderPipeline._acquire_data method. We must ensure the original is restored
+    # before this test runs. A robust way is to use patch as a decorator or context manager,
+    # but for a minimal fix, we save and restore it ourselves.
+    original_acquire_data = LoaderPipeline._acquire_data
+    try:
+        pipeline = LoaderPipeline(
+            adapter=adapter,
+            version=chembl_version,
+            mode="FULL",
+            output_dir=output_dir,
+            include_tables=STANDARD_TABLE_SUBSET,  # Use the official standard subset
+        )
+        pipeline.run()
+
+        # --- 3. Assert that pg_restore was called with the correct arguments ---
+        mock_subprocess_run.assert_called_once()
+    finally:
+        # Restore the original method to avoid polluting other tests
+        LoaderPipeline._acquire_data = original_acquire_data
+
     mock_subprocess_run.assert_called_once()
     call_args = mock_subprocess_run.call_args[0][0]
 
