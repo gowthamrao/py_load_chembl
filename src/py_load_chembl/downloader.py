@@ -22,9 +22,7 @@ class ChecksumError(ValueError):
     """Custom exception for checksum validation errors."""
 
 
-def download_chembl_db(
-    version: int, output_dir: Path, plain_sql: bool = False
-) -> Path:
+def download_chembl_db(version: int, output_dir: Path, plain_sql: bool = False) -> Path:
     """
     Downloads the ChEMBL database dump for a specific version and verifies its integrity.
 

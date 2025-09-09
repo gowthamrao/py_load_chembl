@@ -22,9 +22,7 @@ class TestApi(unittest.TestCase):
             include_tables=["table1", "table2"],
         )
 
-        mock_get_adapter.assert_called_once_with(
-            "postgresql://user:pass@host/db"
-        )
+        mock_get_adapter.assert_called_once_with("postgresql://user:pass@host/db")
 
         mock_pipeline.assert_called_once_with(
             adapter=mock_adapter_instance,
@@ -52,9 +50,7 @@ class TestApi(unittest.TestCase):
             include_tables=["table3"],
         )
 
-        mock_get_adapter.assert_called_once_with(
-            "postgresql://user:pass@host/db"
-        )
+        mock_get_adapter.assert_called_once_with("postgresql://user:pass@host/db")
 
         mock_pipeline.assert_called_once_with(
             adapter=mock_adapter_instance,

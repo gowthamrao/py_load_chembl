@@ -3,8 +3,6 @@ import psycopg2
 import gzip
 import hashlib
 import tarfile
-from pathlib import Path
-import io
 import json
 import logging
 from unittest.mock import patch
@@ -306,7 +304,9 @@ def test_postgres_delta_load_workflow(
             )
             insert_count, update_count = cursor.fetchone()
             assert insert_count == 0, "No new records should be inserted"
-            assert update_count == 2, "Both existing records should be updated by the merge"
+            assert (
+                update_count == 2
+            ), "Both existing records should be updated by the merge"
     finally:
         conn.close()
 
@@ -566,7 +566,6 @@ def test_full_load_standard_representation(
         dir_info.type = tarfile.DIRTYPE
         tar.addfile(dir_info)
     tar_gz_content = tar_gz_path.read_bytes()
-
 
     tar_gz_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/{tar_gz_filename}"
     checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/checksums.txt"
