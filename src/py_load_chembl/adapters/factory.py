@@ -2,6 +2,7 @@ from urllib.parse import urlparse
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
+
 def get_adapter(connection_string: str) -> DatabaseAdapter:
     """
     Factory function that returns the appropriate database adapter based on the

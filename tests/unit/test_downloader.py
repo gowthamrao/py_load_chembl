@@ -79,9 +79,7 @@ def test_download_and_verify_checksum_error(mock_downloader):
     output_dir = mock_params["output_dir"]
     file_path = output_dir / mock_params["file_name"]
 
-    with pytest.raises(
-        ChecksumError, match="is invalid. The file has been deleted."
-    ):
+    with pytest.raises(ChecksumError, match="is invalid. The file has been deleted."):
         downloader.download_chembl_db(
             version=mock_params["version"],
             output_dir=output_dir,
