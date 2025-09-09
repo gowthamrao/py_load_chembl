@@ -3,9 +3,7 @@ from pathlib import Path
 from typing_extensions import Annotated
 import logging
 from py_load_chembl.logging_config import setup_logging
-
-from py_load_chembl.adapters.postgres import PostgresAdapter
-from py_load_chembl.pipeline import LoaderPipeline
+from py_load_chembl import api, downloader
 
 app = typer.Typer(rich_markup_mode="rich")
 logger = logging.getLogger(__name__)
@@ -26,9 +24,9 @@ OutputDirOption = Annotated[
         "--output-dir",
         "-o",
         help="Directory to store downloaded ChEMBL files",
+        rich_help_panel="Advanced Options"
     ),
 ]
-
 
 @app.command()
 def load(
@@ -62,30 +60,32 @@ def load(
     """
     Downloads and loads ChEMBL data into a target database.
     """
-    setup_logging()
-    logger.info("Initiating ChEMBL load", extra={"target": target, "mode": mode, "version": version})
-
-    # For now, we only support postgres
-    if not target.startswith("postgresql"):
-        logger.critical("Only postgresql targets are currently supported.", extra={"target": target})
-        raise typer.Exit(code=1)
-
     table_list = include_tables.split(",") if include_tables else None
 
-    adapter = PostgresAdapter(connection_string=target)
-    pipeline = LoaderPipeline(
-        adapter=adapter,
-        version=version,
-        mode=mode,
-        output_dir=output_dir,
-        include_tables=table_list,
-    )
-
     try:
-        pipeline.run()
-        typer.echo("\n[bold green]ChEMBL load process completed successfully![/bold green]")
+        if mode.upper() == 'FULL':
+            api.full_load(
+                connection_string=target,
+                chembl_version=version,
+                output_dir=output_dir,
+                include_tables=table_list,
+            )
+        elif mode.upper() == 'DELTA':
+            api.delta_load(
+                connection_string=target,
+                chembl_version=version,
+                output_dir=output_dir,
+                include_tables=table_list,
+            )
+        else:
+            logger.critical(f"Invalid mode: {mode}. Must be 'FULL' or 'DELTA'.")
+            raise typer.Exit(code=1)
+
+        typer.echo(f"\n[bold green]ChEMBL {mode.upper()} load process completed successfully![/bold green]")
+
     except (ConnectionError, ValueError, RuntimeError) as e:
-        logger.critical(f"A critical error occurred during the load process: {e}", exc_info=True)
+        # The API functions will log the detailed error, so we just need to show the user a clean message.
+        logger.critical(f"A critical error occurred during the load process: {e}")
         raise typer.Exit(code=1)
 
 
@@ -95,19 +95,29 @@ def download(
     output_dir: OutputDirOption = Path("./chembl_data"),
 ):
     """
-    Downloads ChEMBL data files without loading them into a database.
+    Downloads and verifies ChEMBL data files without loading them into a database.
     """
     setup_logging()
     logger.info("Initiating ChEMBL download only", extra={"version": version, "output_dir": str(output_dir)})
 
-    # No adapter or mode is needed for download-only
-    pipeline = LoaderPipeline(version=version, output_dir=output_dir)
-
     try:
-        # The pipeline's _acquire_data is a protected member, but for the CLI's purpose,
-        # this is a clean way to reuse the data acquisition logic.
-        pipeline._acquire_data()
-        typer.echo("\n[bold green]ChEMBL download process completed successfully![/bold green]")
+        # This is a CLI-specific convenience. It directly uses the downloader module.
+        if version.lower() == "latest":
+            chembl_version = downloader.get_latest_chembl_version()
+        else:
+            chembl_version = int(version)
+
+        # We download the .tar.gz by default as it's the most common use case (full load)
+        dump_url, checksum_url = downloader.get_chembl_file_urls(chembl_version, plain_sql=False)
+
+        downloaded_file = downloader.download_file(dump_url, output_dir)
+        is_valid = downloader.verify_checksum(downloaded_file, checksum_url)
+        if not is_valid:
+            raise ValueError("Downloaded file failed checksum verification.")
+
+        typer.echo(f"\n[bold green]ChEMBL {version} download process completed successfully![/bold green]")
+        typer.echo(f"File saved to: {downloaded_file}")
+
     except (ConnectionError, ValueError) as e:
         logger.critical(f"A critical error occurred during the download process: {e}", exc_info=True)
         raise typer.Exit(code=1)

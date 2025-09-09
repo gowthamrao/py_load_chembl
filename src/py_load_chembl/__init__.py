@@ -1,7 +1,4 @@
-import importlib.metadata
+from ._version import __version__
+from .api import delta_load, full_load
 
-try:
-    __version__ = importlib.metadata.version("py-load-chembl")
-except importlib.metadata.PackageNotFoundError:
-    # This happens when the package is not installed in editable mode.
-    __version__ = "0.0.0-dev"
+__all__ = ["full_load", "delta_load", "__version__"]
