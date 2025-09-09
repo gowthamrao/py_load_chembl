@@ -180,11 +180,10 @@ class LoaderPipeline:
                 logger.info(f"--- Processing table: {table_name} ---")
 
                 # 4a. Compare schemas and migrate if necessary before merging
-                self.adapter.migrate_schema(
+                self._perform_schema_migration(
                     source_schema=staging_schema,
-                    source_table_name=table_name,
                     target_schema=target_schema,
-                    target_table_name=table_name,
+                    table_name=table_name,
                 )
 
                 # 4b. Get primary key info from our dynamically parsed schema
@@ -206,26 +205,81 @@ class LoaderPipeline:
                     primary_keys=table_schema_info.primary_keys,
                     all_columns=all_columns,
                 )
-
-                # 4e. Perform the soft-delete operation
-                obsolete_count = self.adapter.soft_delete_obsolete_records(
-                    source_table=f'{staging_schema}."{table_name}"',
-                    target_table=f'{target_schema}."{table_name}"',
-                    primary_keys=table_schema_info.primary_keys,
-                )
-
                 self._log_load_details_to_db(
                     table_name=table_name,
                     insert_count=merge_stats.get("inserted", 0),
                     update_count=merge_stats.get("updated", 0),
-                    obsolete_count=obsolete_count,
+                    obsolete_count=0, # Obsolete count is handled in a separate step now
                 )
 
+            # 5. Handle obsolete records using the correct FRD-compliant method.
+            # This is done once after all tables are merged.
+            logger.info("--- Handling Obsolete Records ---")
+            obsolete_count = self.adapter.handle_obsolete_records(
+                source_schema=staging_schema,
+                target_schema=target_schema,
+            )
+            self._log_load_details_to_db(
+                table_name="chembl_id_lookup",
+                insert_count=0, # Already logged during its own merge
+                update_count=0, # Already logged
+                obsolete_count=obsolete_count,
+            )
+
         finally:
-            # 5. Clean up by dropping the staging schema
+            # 6. Clean up by dropping the staging schema
             logger.info(f"Cleaning up temporary staging schema '{staging_schema}'...")
             self.adapter.execute_sql(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
             logger.info("Cleanup complete.")
+
+    def _perform_schema_migration(self, source_schema: str, target_schema: str, table_name: str):
+        """
+        Orchestrates schema migration for a single table. It uses the adapter's
+        generic methods to compare schemas and apply additive changes.
+        This logic resides in the pipeline, not the adapter, to keep the adapter
+        interface clean and focused on database-specific execution.
+        """
+        if not self.adapter:
+            return
+
+        logger.info(f"Checking for schema changes for table '{table_name}'...")
+
+        # Check if target table exists
+        target_table_exists = self.adapter.get_table_names(target_schema)
+        if table_name not in target_table_exists:
+            logger.info(f"Target table '{target_schema}.{table_name}' does not exist. Creating it.")
+            # This LIKE statement is specific to PostgreSQL but is a reasonable default.
+            # A more advanced implementation might use an abstract method in the adapter.
+            create_sql = f'CREATE TABLE "{target_schema}"."{table_name}" (LIKE "{source_schema}"."{table_name}" INCLUDING ALL);'
+            self.adapter.execute_sql(create_sql)
+            logger.info(f"Table '{target_schema}.{table_name}' created.")
+            return
+
+        # Get column definitions from source and target to find new columns
+        source_cols = self.adapter.get_column_definitions(schema=source_schema, table_name=table_name)
+        target_cols = self.adapter.get_column_definitions(schema=target_schema, table_name=table_name)
+        source_col_names = {c['name'] for c in source_cols}
+        target_col_names = {c['name'] for c in target_cols}
+
+        new_columns = source_col_names - target_col_names
+
+        if not new_columns:
+            logger.info(f"No schema changes found for table '{table_name}'.")
+            return
+
+        logger.info(f"Found new columns to add to '{table_name}': {', '.join(new_columns)}")
+        for col in source_cols:
+            if col['name'] in new_columns:
+                # Construct the full data type, e.g., "VARCHAR(255)"
+                data_type = col['type']
+                if col.get('length'):
+                    data_type = f"{data_type}({col['length']})"
+
+                alter_sql = f'ALTER TABLE "{target_schema}"."{table_name}" ADD COLUMN "{col["name"]}" {data_type};'
+                logger.info(f"Applying schema change: {alter_sql}")
+                self.adapter.execute_sql(alter_sql)
+
+        logger.info(f"Successfully migrated schema for table '{table_name}'.")
 
     def _log_start_to_db(self):
         """Initializes metadata tables and logs the start of the process to the database."""
