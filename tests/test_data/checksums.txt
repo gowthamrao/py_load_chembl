@@ -1,0 +1,1 @@
+a609273fb111ea7b39b6973b7482e720  chembl_test_postgresql.tar.gz

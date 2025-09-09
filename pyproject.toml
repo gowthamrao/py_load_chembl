@@ -1,0 +1,47 @@
+[tool.poetry]
+name = "py_load_chembl"
+version = "0.1.0"
+description = "A Python package for loading the ChEMBL database into various relational database systems."
+authors = ["Gowtham Rao rao@ohdsi.org"]
+license = "Apache-2.0"
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.9"
+psycopg2-binary = { version = "^2.9.9", optional = true }
+requests = "^2.31.0"
+typer = {extras = ["rich"], version = "^0.9.0"}
+sqlparse = "^0.5.0"
+
+[tool.poetry.extras]
+postgres = ["psycopg2-binary"]
+
+[tool.poetry.group.test.dependencies]
+pytest = "^7.4.0"
+requests-mock = "^1.11.0"
+psycopg2-binary = "^2.9.9"
+rich = "^13.7.1"
+sqlparse = "^0.5.0"
+pytest-docker = "^3.2.3"
+ruff = "^0.1.0"
+mypy = "^1.5.0"
+black = "^23.9.0"
+types-requests = "^2.31.0"
+types-psycopg2 = "^2.9.21"
+pytest-cov = "^4.1.0"
+
+[tool.poetry.scripts]
+py-load-chembl = "py_load_chembl.cli:main"
+
+[tool.pytest.ini_options]
+pythonpath = [
+  "src"
+]
+addopts = "--cov=src/py_load_chembl --cov-report=term-missing"
+markers = [
+    "integration: marks tests as integration tests (requires docker)",
+]
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"

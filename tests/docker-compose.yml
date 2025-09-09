@@ -1,0 +1,15 @@
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      - POSTGRES_USER=testuser
+      - POSTGRES_PASSWORD=testpassword
+      - POSTGRES_DB=testdb # This is the initial DB, the test creates its own.
+    ports:
+      - "5432" # The port will be dynamically assigned by pytest-docker
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U testuser -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
