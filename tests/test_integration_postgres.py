@@ -570,7 +570,7 @@ def test_delta_load_with_table_subset(postgres_service, tmp_path, requests_mock)
 
 
 @patch("subprocess.run")
-def test_full_load_standard_representation_mocked(
+def test_full_load_standard_representation(
     mock_subprocess_run, postgres_service, tmp_path, requests_mock
 ):
     """
@@ -582,18 +582,25 @@ def test_full_load_standard_representation_mocked(
     chembl_version = "99"
     output_dir = tmp_path / "chembl_data"
 
-    # Create a dummy tar.gz file to satisfy the download and extraction logic
+    # Create a dummy tar.gz file to satisfy the download and extraction logic.
+    # This ensures we test the .tar.gz code path in the adapter.
     tar_gz_filename = f"chembl_{chembl_version}_postgresql.tar.gz"
-    tar_gz_buffer = io.BytesIO()
-    with tarfile.open(fileobj=tar_gz_buffer, mode="w:gz") as tar:
+    tar_gz_path = output_dir / tar_gz_filename
+    tar_gz_path.parent.mkdir(exist_ok=True)
+    with tarfile.open(tar_gz_path, "w:gz") as tar:
+        # The tar file needs at least one member to be valid.
+        # The 'pg_restore' logic looks for a directory inside the tar.
         dir_info = tarfile.TarInfo(name=f"chembl_{chembl_version}_postgresql")
         dir_info.type = tarfile.DIRTYPE
         tar.addfile(dir_info)
-    tar_gz_content = tar_gz_buffer.getvalue()
+    tar_gz_content = tar_gz_path.read_bytes()
+
 
     tar_gz_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/{tar_gz_filename}"
     checksum_url = f"https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/chembl_{chembl_version}/checksums.txt"
     checksum = hashlib.md5(tar_gz_content).hexdigest()
+
+    # Mock the release list and file downloads
     requests_mock.get(
         "https://ftp.ebi.ac.uk/pub/databases/chembl/ChEMBLdb/releases/",
         text=f'<a href="chembl_{chembl_version}/"></a>',
@@ -608,35 +615,29 @@ def test_full_load_standard_representation_mocked(
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
 
-    # This test is sensitive to test pollution from other tests that monkeypatch
-    # the LoaderPipeline._acquire_data method. We must ensure the original is restored
-    # before this test runs. A robust way is to use patch as a decorator or context manager,
-    # but for a minimal fix, we save and restore it ourselves.
-    original_acquire_data = LoaderPipeline._acquire_data
-    try:
-        pipeline = LoaderPipeline(
-            adapter=adapter,
-            version=chembl_version,
-            mode="FULL",
-            output_dir=output_dir,
-            include_tables=STANDARD_TABLE_SUBSET,  # Use the official standard subset
-        )
-        pipeline.run()
+    # In a real FULL load, the pipeline downloads a .tar.gz file.
+    # No monkeypatching of _acquire_data is needed if we mock the download correctly.
+    pipeline = LoaderPipeline(
+        adapter=adapter,
+        version=chembl_version,
+        mode="FULL",
+        output_dir=output_dir,
+        include_tables=STANDARD_TABLE_SUBSET,  # Use the official standard subset
+    )
+    pipeline.run()
 
-        # --- 3. Assert that pg_restore was called with the correct arguments ---
-        mock_subprocess_run.assert_called_once()
-    finally:
-        # Restore the original method to avoid polluting other tests
-        LoaderPipeline._acquire_data = original_acquire_data
-
+    # --- 3. Assert that pg_restore was called with the correct arguments ---
     mock_subprocess_run.assert_called_once()
     call_args = mock_subprocess_run.call_args[0][0]
 
+    # Check that pg_restore is being called
     assert "pg_restore" in call_args
-    table_flag_indices = [i for i, arg in enumerate(call_args) if arg == "--table"]
-    assert len(table_flag_indices) == len(STANDARD_TABLE_SUBSET)
-    for i in table_flag_indices:
-        assert call_args[i + 1] in STANDARD_TABLE_SUBSET
+
+    # Check that every table in the standard subset has a corresponding --table flag
+    actual_tables_in_command = {
+        call_args[i + 1] for i, arg in enumerate(call_args) if arg == "--table"
+    }
+    assert actual_tables_in_command == set(STANDARD_TABLE_SUBSET)
 
 
 def test_delta_load_handles_obsolete_records(postgres_service, tmp_path, requests_mock):
