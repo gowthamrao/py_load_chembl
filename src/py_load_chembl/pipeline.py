@@ -3,7 +3,7 @@ from pathlib import Path
 from py_load_chembl import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
-from py_load_chembl.db_schemas import CHEMBL_SCHEMAS
+from py_load_chembl.schema_parser import parse_chembl_ddl
 
 
 class LoaderPipeline:
@@ -85,7 +85,7 @@ class LoaderPipeline:
             else:
                 print("Checksum is invalid. Re-downloading the file.")
 
-        downloaded_file = downloader.download_file(pg_dump_url, self.output_dir)
+        downloaded_file = downloader.download_file(dump_url, self.output_dir)
 
         print("Verifying file integrity...")
         is_valid = downloader.verify_checksum(downloaded_file, checksums_url)
@@ -137,22 +137,27 @@ class LoaderPipeline:
         try:
             # 1. Load new data into a temporary staging schema
             print(f"Loading ChEMBL v{self.chembl_version} into temporary schema '{staging_schema}'...")
+            # Note: The .sql.gz dump is required for delta mode.
             self.adapter.bulk_load_table(
-                table_name="all",  # This is ignored by the pg_restore implementation
+                table_name="all",
                 data_source=self.pg_dump_path,
                 schema=staging_schema,
             )
             print("Staging load complete.")
 
-            # 2. Get the list of tables to merge from the staging schema
+            # 2. Dynamically parse the DDL to get primary key information.
+            # This makes the process robust and independent of a static, manually maintained file.
+            chembl_schemas = parse_chembl_ddl(self.pg_dump_path)
+
+            # 3. Get the list of tables to merge from the staging schema
             tables_to_merge = self.adapter.get_table_names(schema=staging_schema)
             print(f"Found {len(tables_to_merge)} tables in staging schema to process.")
 
-            # 3. Iterate and merge each table
+            # 4. Iterate and merge each table
             for table_name in tables_to_merge:
                 print(f"\n--- Processing table: {table_name} ---")
 
-                # 3a. Compare schemas and migrate if necessary before merging
+                # 4a. Compare schemas and migrate if necessary before merging
                 self.adapter.migrate_schema(
                     source_schema=staging_schema,
                     source_table_name=table_name,
@@ -160,18 +165,19 @@ class LoaderPipeline:
                     target_table_name=table_name,
                 )
 
-                table_schema_info = CHEMBL_SCHEMAS.get(table_name)
+                # 4b. Get primary key info from our dynamically parsed schema
+                table_schema_info = chembl_schemas.get(table_name)
                 if not table_schema_info or not table_schema_info.primary_keys:
-                    print(f"Warning: No primary key definition for table '{table_name}'. Skipping merge.")
+                    print(f"Warning: No primary key definition found for table '{table_name}'. Skipping merge.")
                     continue
 
-                # Introspect the staging table to get all column names for the merge
+                # 4c. Introspect the staging table to get all column names for the merge
                 all_columns = self.adapter.get_column_names(schema=staging_schema, table_name=table_name)
                 if not all_columns:
                     print(f"Warning: Could not find columns for table '{table_name}'. Skipping merge.")
                     continue
 
-                # Perform the merge from staging to production
+                # 4d. Perform the merge from staging to production
                 merge_stats = self.adapter.execute_merge(
                     source_table=f'{staging_schema}."{table_name}"',
                     target_table=f'{target_schema}."{table_name}"',
@@ -186,7 +192,7 @@ class LoaderPipeline:
                 )
 
         finally:
-            # 4. Clean up by dropping the staging schema
+            # 5. Clean up by dropping the staging schema
             print(f"\nCleaning up temporary staging schema '{staging_schema}'...")
             self.adapter.execute_sql(f"DROP SCHEMA IF EXISTS {staging_schema} CASCADE;")
             print("Cleanup complete.")

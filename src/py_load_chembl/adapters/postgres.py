@@ -308,39 +308,33 @@ class PostgresAdapter(DatabaseAdapter):
         ]
 
         try:
-            # We decompress the file and pipe its contents along with a prepended
-            # command to psql. This avoids writing a large intermediate file to disk.
-            with gzip.open(dump_archive_path, 'rt', encoding='utf-8') as f_in:
-                # Prepend the command to set the schema for this session
-                # All tables/indexes/etc. in the script will be created in the target schema.
-                prepended_sql = f'SET search_path = "{schema}", public;\n'
+            # Decompress the entire file into memory. This is safer for subprocess handling
+            # and ChEMBL SQL files, while large, should be manageable for this operation.
+            with gzip.open(dump_archive_path, 'rt', encoding='utf-8') as f:
+                sql_content = f.read()
 
-                # Use subprocess.Popen to handle streaming the input
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
+            # Prepend the command to set the schema for this session.
+            # All tables/indexes/etc. in the script will be created in the target schema.
+            full_script = f'SET search_path = "{schema}", public;\n{sql_content}'
+
+            # Use subprocess.run and pass the entire script via stdin.
+            # This is a more robust way to handle process I/O than manual piping.
+            process = subprocess.run(
+                command,
+                input=full_script,
+                capture_output=True,
+                text=True,
+                check=False,  # We will check the return code manually
+                env=env,
+            )
+
+            if process.returncode != 0:
+                error_message = (
+                    f"psql failed with exit code {process.returncode}.\n"
+                    f"--- STDOUT ---\n{process.stdout}\n"
+                    f"--- STDERR ---\n{process.stderr}"
                 )
-
-                # Write the prepended command first
-                process.stdin.write(prepended_sql)
-
-                # Stream the rest of the file to stdin
-                shutil.copyfileobj(f_in, process.stdin)
-                process.stdin.close()  # Close stdin to signal end of input
-
-                stdout, stderr = process.communicate()
-
-                if process.returncode != 0:
-                    error_message = (
-                        f"psql failed with exit code {process.returncode}.\n"
-                        f"--- STDOUT ---\n{stdout}\n"
-                        f"--- STDERR ---\n{stderr}"
-                    )
-                    raise RuntimeError(error_message)
+                raise RuntimeError(error_message)
 
             print(f"Successfully loaded dump into schema '{schema}'.")
 
