@@ -5,7 +5,7 @@ import hashlib
 import tarfile
 import json
 import logging
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 from py_load_chembl.config import STANDARD_TABLE_SUBSET
 from py_load_chembl.logging_config import JsonFormatter
@@ -62,15 +62,17 @@ def is_postgres_ready(host, port, user, password, dbname):
         return False
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_postgres_full_load(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock, caplog
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock, caplog
 ):
     """
     Tests the end-to-end FULL load process against a containerized PostgreSQL.
     This test now mocks subprocess calls to avoid dependency on local psql/pg_restore.
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/pg_restore"
     handler = caplog.handler
     handler.setFormatter(JsonFormatter())
     caplog.set_level(logging.INFO)
@@ -197,14 +199,16 @@ def test_postgres_full_load(
             conn.close()
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_postgres_delta_load_workflow(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock, caplog
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock, caplog
 ):
     """
     Tests the delta load workflow, mocking subprocess calls.
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/psql"
     # --- 1. Setup: Manually create the initial "production" state ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
@@ -364,14 +368,16 @@ def _cleanup_db(pg_config):
         pass
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_delta_load_with_schema_migration(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock
 ):
     """
     Tests the delta load with schema evolution (new tables and new columns).
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/psql"
     # --- 1. Setup initial DB state (v1) ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
@@ -456,14 +462,16 @@ def test_delta_load_with_schema_migration(
     conn.close()
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_delta_load_with_table_subset(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock
 ):
     """
     Tests that a DELTA load with `include_tables` only affects the specified tables.
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/psql"
     # --- 1. Setup initial DB state ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
@@ -541,9 +549,10 @@ def test_delta_load_with_table_subset(
         conn.close()
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_full_load_standard_representation(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock
 ):
     """
     Tests that a FULL load with the 'standard' representation correctly calls
@@ -580,7 +589,8 @@ def test_full_load_standard_representation(
     requests_mock.get(checksum_url, text=f"{checksum}  {tar_gz_filename}")
 
     # Mock the return value of subprocess.run to prevent it from actually running pg_restore
-    mock_subprocess_run.return_value.returncode = 0
+    mock_shutil_which.return_value = "/usr/bin/pg_restore"
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
 
     # --- 2. Configure and run the pipeline ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
@@ -611,15 +621,17 @@ def test_full_load_standard_representation(
     assert actual_tables_in_command == set(STANDARD_TABLE_SUBSET)
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_delta_load_handles_obsolete_records(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock
 ):
     """
     Tests that the delta load correctly handles obsolete records according to the FRD.
     It should update the 'status' field in the 'chembl_id_lookup' table.
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/psql"
     # --- 1. Setup initial DB state ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)
@@ -704,14 +716,16 @@ def test_delta_load_handles_obsolete_records(
         conn.close()
 
 
+@patch("shutil.which")
 @patch("subprocess.run")
 def test_full_load_with_optimizations(
-    mock_subprocess_run, postgres_service, tmp_path, requests_mock, caplog
+    mock_subprocess_run, mock_shutil_which, postgres_service, tmp_path, requests_mock, caplog
 ):
     """
     Tests that the full load process correctly uses the pre/post load optimizations.
     """
-    mock_subprocess_run.return_value.returncode = 0
+    mock_subprocess_run.return_value = MagicMock(returncode=0)
+    mock_shutil_which.return_value = "/usr/bin/pg_restore"
     # --- 1. Setup a dirty database state ---
     adapter = PostgresAdapter(connection_string=postgres_service["uri"])
     _create_database(postgres_service)

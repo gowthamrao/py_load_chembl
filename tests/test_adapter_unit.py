@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
+import pytest
 
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
@@ -112,3 +113,29 @@ class TestPostgresAdapterUnit(unittest.TestCase):
             command_list = call_args[0]
 
             self.assertNotIn("--table", command_list)
+
+@pytest.fixture
+def postgres_adapter():
+    return PostgresAdapter("postgresql://user:password@host:5432/dbname")
+
+@patch("shutil.which", return_value="/usr/bin/pg_restore")
+@patch("subprocess.run")
+def test_run_pg_restore_failure(mock_subprocess_run, mock_shutil_which, postgres_adapter, tmp_path):
+    """Test _run_pg_restore when pg_restore fails."""
+    mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="error", stderr="error")
+    dump_path = tmp_path / "dump.tar.gz"
+    dump_path.touch()
+
+    with pytest.raises(RuntimeError):
+        postgres_adapter._run_pg_restore(dump_path)
+
+@patch("shutil.which", return_value="/usr/bin/psql")
+@patch("subprocess.run")
+def test_run_psql_restore_failure(mock_subprocess_run, mock_shutil_which, postgres_adapter, tmp_path):
+    """Test _run_psql_restore when psql fails."""
+    mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="error", stderr="error")
+    dump_path = tmp_path / "dump.sql.gz"
+    dump_path.touch()
+
+    with pytest.raises(RuntimeError):
+        postgres_adapter._run_psql_restore(dump_path, "public")
