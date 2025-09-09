@@ -3,7 +3,8 @@ from pathlib import Path
 from py_load_chembl import __version__
 from py_load_chembl.adapters.base import DatabaseAdapter
 from py_load_chembl import downloader
-from py_load_chembl.db_schemas import CHEMBL_SCHEMAS
+from py_load_chembl.db_schemas import CHEMBL_SCHEMAS, CHEMBL_TABLE_DEPENDENCIES
+from py_load_chembl.utils import topological_sort_tables
 
 
 class LoaderPipeline:
@@ -85,7 +86,7 @@ class LoaderPipeline:
             else:
                 print("Checksum is invalid. Re-downloading the file.")
 
-        downloaded_file = downloader.download_file(pg_dump_url, self.output_dir)
+        downloaded_file = downloader.download_file(dump_url, self.output_dir)
 
         print("Verifying file integrity...")
         is_valid = downloader.verify_checksum(downloaded_file, checksums_url)
@@ -145,8 +146,13 @@ class LoaderPipeline:
             print("Staging load complete.")
 
             # 2. Get the list of tables to merge from the staging schema
-            tables_to_merge = self.adapter.get_table_names(schema=staging_schema)
-            print(f"Found {len(tables_to_merge)} tables in staging schema to process.")
+            staged_tables = self.adapter.get_table_names(schema=staging_schema)
+            print(f"Found {len(staged_tables)} tables in staging schema to process.")
+
+            # Sort the tables topologically to respect foreign key constraints
+            print("Sorting tables by dependency order...")
+            tables_to_merge = topological_sort_tables(staged_tables, CHEMBL_TABLE_DEPENDENCIES)
+            print(f"Merge order: {', '.join(tables_to_merge)}")
 
             # 3. Iterate and merge each table
             for table_name in tables_to_merge:

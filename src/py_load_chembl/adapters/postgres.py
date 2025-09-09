@@ -277,90 +277,56 @@ class PostgresAdapter(DatabaseAdapter):
 
     def _run_psql_restore(self, dump_archive_path: Path, schema: str):
         """
-        Decompresses a .sql.gz dump and loads it into a specific schema using psql.
+        Decompresses a .sql.gz dump and loads it into a specific schema using psycopg2.
         This is used for delta loads to load data into a staging schema.
+        This pure Python implementation avoids dependency on the `psql` command-line tool.
         """
-        if not shutil.which("psql"):
-            raise FileNotFoundError(
-                "'psql' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
-            )
-
-        print(f"Initiating PSQL restore from '{dump_archive_path}' into schema '{schema}'...")
-
-        # Prepare the environment for psql
-        env = os.environ.copy()
-        env["PGHOST"] = self._parsed_uri.hostname or "localhost"
-        env["PGPORT"] = str(self._parsed_uri.port or 5432)
-        env["PGUSER"] = self._parsed_uri.username or ""
-        if self._parsed_uri.password:
-            env["PGPASSWORD"] = self._parsed_uri.password
-
-        # Create the target schema before running psql
-        self.execute_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
-
-        command = [
-            "psql",
-            f"--dbname={self._parsed_uri.path.lstrip('/')}",
-            "--quiet",  # Suppress informational messages
-            "--no-psqlrc",  # Do not read psqlrc file
-            "--single-transaction",  # Run the entire script in a single transaction
-            "-v", "ON_ERROR_STOP=1",  # Exit on error
-        ]
+        print(f"Initiating Python-based SQL restore from '{dump_archive_path}' into schema '{schema}'...")
 
         try:
-            # We decompress the file and pipe its contents along with a prepended
-            # command to psql. This avoids writing a large intermediate file to disk.
+            # 1. Create the target schema
+            self.execute_sql(f'CREATE SCHEMA IF NOT EXISTS "{schema}";')
+
+            # 2. Decompress the gzipped SQL file into memory
+            print("Decompressing SQL script...")
             with gzip.open(dump_archive_path, 'rt', encoding='utf-8') as f_in:
-                # Prepend the command to set the schema for this session
-                # All tables/indexes/etc. in the script will be created in the target schema.
-                prepended_sql = f'SET search_path = "{schema}", public;\n'
+                sql_script = f_in.read()
+            print("Decompression complete.")
 
-                # Use subprocess.Popen to handle streaming the input
-                process = subprocess.Popen(
-                    command,
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
-                )
+            # 3. Prepend command to set the session's search path
+            # This ensures all objects in the script are created in the target schema.
+            full_script = f'SET search_path = "{schema}", public;\n{sql_script}'
 
-                # Write the prepended command first
-                process.stdin.write(prepended_sql)
+            # 4. Execute the entire script in a single transaction
+            print(f"Executing script in schema '{schema}'...")
+            conn = self.connect()
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute(full_script)
+                conn.commit()
+                print(f"Successfully loaded dump into schema '{schema}'.")
+            except psycopg2.Error as e:
+                conn.rollback()
+                raise RuntimeError(f"Database script execution failed in schema '{schema}': {e}") from e
 
-                # Stream the rest of the file to stdin
-                shutil.copyfileobj(f_in, process.stdin)
-                process.stdin.close()  # Close stdin to signal end of input
-
-                stdout, stderr = process.communicate()
-
-                if process.returncode != 0:
-                    error_message = (
-                        f"psql failed with exit code {process.returncode}.\n"
-                        f"--- STDOUT ---\n{stdout}\n"
-                        f"--- STDERR ---\n{stderr}"
-                    )
-                    raise RuntimeError(error_message)
-
-            print(f"Successfully loaded dump into schema '{schema}'.")
-
-        except FileNotFoundError:
-            raise RuntimeError(
-                f"psql command not found. Make sure PostgreSQL client tools are installed and in your PATH."
-            )
         except Exception as e:
-            # Catch other potential errors during process execution
-            raise RuntimeError(f"An error occurred during psql execution: {e}") from e
+            raise RuntimeError(f"An error occurred during Python-based SQL restore: {e}") from e
 
     def _run_pg_restore(self, dump_archive_path: Path, schema: str | None = None):
         """
         Extracts the dump and runs the pg_restore command.
         If a schema is provided, it restores into that schema.
         """
-        if not shutil.which("pg_restore"):
-            raise FileNotFoundError(
-                "'pg_restore' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
-            )
+        # First, try the standard PATH, then try a common hardcoded path for Debian-based containers.
+        pg_restore_cmd = shutil.which("pg_restore")
+        if not pg_restore_cmd:
+            hardcoded_path = "/usr/lib/postgresql/15/bin/pg_restore"
+            if os.path.exists(hardcoded_path):
+                pg_restore_cmd = hardcoded_path
+            else:
+                raise FileNotFoundError(
+                    "'pg_restore' command not found. Please ensure the PostgreSQL client tools are installed and in your system's PATH."
+                )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             print(f"Extracting '{dump_archive_path.name}' to a temporary directory...")
@@ -382,7 +348,7 @@ class PostgresAdapter(DatabaseAdapter):
             jobs = os.cpu_count() or 4
 
             command = [
-                "pg_restore",
+                pg_restore_cmd,
                 "--verbose",
                 "--exit-on-error",
                 f"--dbname={self._parsed_uri.path.lstrip('/')}",

@@ -29,3 +29,44 @@ CHEMBL_SCHEMAS = {
     # This is not a complete list, but represents the core tables
     # and is sufficient to prove the delta load strategy works.
 }
+
+# Defines the directed graph of table dependencies (foreign key relationships)
+# A tuple (A, B) means table A depends on table B (A has a FK to B),
+# so B must be loaded before A.
+CHEMBL_TABLE_DEPENDENCIES = [
+    # Core Dependencies
+    ("molecule_dictionary", "chembl_id_lookup"),
+    ("compound_records", "docs"),
+    ("compound_records", "molecule_dictionary"),
+    ("compound_structures", "molecule_dictionary"),
+    ("target_dictionary", "chembl_id_lookup"),
+    ("assays", "target_dictionary"),
+    ("assays", "docs"),
+    ("assays", "cell_dictionary"),
+    ("activities", "assays"),
+    ("activities", "molecule_dictionary"),
+    ("activities", "docs"),
+
+    # Other Important Relationships
+    ("protein_classification", "protein_family_classification"),
+    ("target_relations", "target_dictionary"),
+    ("target_components", "target_dictionary"),
+    ("component_sequences", "target_components"),
+    ("component_domains", "component_sequences"),
+    ("bio_component_sequences", "component_sequences"),
+    ("biotherapeutic_components", "biotherapeutics"),
+    ("biotherapeutics", "molecule_dictionary"),
+    ("formulations", "molecule_dictionary"),
+    ("formulations", "products"),
+    ("products", "molecule_dictionary"),
+    ("drug_mechanism", "molecule_dictionary"),
+    ("drug_mechanism", "target_dictionary"),
+    ("drug_indication", "molecule_dictionary"),
+    ("compound_properties", "molecule_dictionary"),
+    ("compound_structural_alerts", "molecule_dictionary"),
+    ("molecule_atc_classification", "molecule_dictionary"),
+    ("molecule_hierarchy", "molecule_dictionary"),
+    ("molecule_synonyms", "molecule_dictionary"),
+    ("activities_supp", "activities"),
+    ("activity_properties", "activities"),
+]
