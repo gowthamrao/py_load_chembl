@@ -379,7 +379,9 @@ class PostgresAdapter(DatabaseAdapter):
         Creates a new table in the target schema with the same schema as the source table
         using PostgreSQL's 'LIKE' syntax.
         """
-        logger.info(f"Creating table '{target_schema}.{table_name}' like '{source_schema}.{table_name}'...")
+        logger.info(
+            f"Creating table '{target_schema}.{table_name}' like '{source_schema}.{table_name}'..."
+        )
         sql = f'CREATE TABLE "{target_schema}"."{table_name}" (LIKE "{source_schema}"."{table_name}" INCLUDING ALL);'
         self.execute_sql(sql)
         logger.info(f"Table '{target_schema}.{table_name}' created successfully.")
@@ -447,7 +449,9 @@ class PostgresAdapter(DatabaseAdapter):
             if unlogged:
                 # Use simple string replacement. It's fast and the ChEMBL DDL is consistent.
                 # A regex would be overkill and potentially slower.
-                sql_content = sql_content.replace("CREATE TABLE", "CREATE UNLOGGED TABLE")
+                sql_content = sql_content.replace(
+                    "CREATE TABLE", "CREATE UNLOGGED TABLE"
+                )
 
             full_script = f'SET search_path = "{schema}", public;\n{sql_content}'
 
