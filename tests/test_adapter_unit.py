@@ -118,20 +118,31 @@ class TestPostgresAdapterUnit(unittest.TestCase):
 def postgres_adapter():
     return PostgresAdapter("postgresql://user:password@host:5432/dbname")
 
+import tarfile
+import gzip
+
 @patch("shutil.which", return_value="/usr/bin/pg_restore")
 @patch("subprocess.run")
 def test_run_pg_restore_failure(mock_subprocess_run, mock_shutil_which, postgres_adapter, tmp_path):
     """Test _run_pg_restore when pg_restore fails."""
     mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="error", stderr="error")
     dump_path = tmp_path / "dump.tar.gz"
-    dump_path.touch()
+    # Create a valid, empty, gzipped tar file with a directory inside
+    with gzip.open(dump_path, "wb") as f_gz:
+        with tarfile.open(fileobj=f_gz, mode="w") as tar:
+            # Add a dummy directory
+            dir_info = tarfile.TarInfo(name="dummy_dir")
+            dir_info.type = tarfile.DIRTYPE
+            tar.addfile(dir_info)
 
     with pytest.raises(RuntimeError):
         postgres_adapter._run_pg_restore(dump_path)
 
+
 @patch("shutil.which", return_value="/usr/bin/psql")
 @patch("subprocess.run")
-def test_run_psql_restore_failure(mock_subprocess_run, mock_shutil_which, postgres_adapter, tmp_path):
+@patch.object(PostgresAdapter, "connect", return_value=MagicMock())
+def test_run_psql_restore_failure(mock_connect, mock_subprocess_run, mock_shutil_which, postgres_adapter, tmp_path):
     """Test _run_psql_restore when psql fails."""
     mock_subprocess_run.return_value = MagicMock(returncode=1, stdout="error", stderr="error")
     dump_path = tmp_path / "dump.sql.gz"
