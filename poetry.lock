@@ -170,14 +170,14 @@ files = [
 
 [[package]]
 name = "click"
-version = "8.1.8"
+version = "8.0.0"
 description = "Composable command line interface toolkit"
 optional = false
-python-versions = ">=3.7"
+python-versions = ">=3.6"
 groups = ["main", "test"]
 files = [
-    {file = "click-8.1.8-py3-none-any.whl", hash = "sha256:63c132bbbed01578a06712a2d1f497bb62d9c1c0d329b7903a866228027263b2"},
-    {file = "click-8.1.8.tar.gz", hash = "sha256:ed53c9d8990d83c2a27deae68e4ee337473f6330c040a31d4225c9574d16096a"},
+    {file = "click-8.0.0-py3-none-any.whl", hash = "sha256:e90e62ced43dc8105fb9a26d62f0d9340b5c8db053a814e25d95c19873ae87db"},
+    {file = "click-8.0.0.tar.gz", hash = "sha256:7d8c289ee437bcb0316820ccee14aefcb056e58d31830ecab8e47eda6540e136"},
 ]
 
 [package.dependencies]
@@ -899,4 +899,4 @@ postgres = ["psycopg2-binary"]
 [metadata]
 lock-version = "2.1"
 python-versions = "^3.9"
-content-hash = "6e59f994a86dccee9245996b300529ce55b9463527163d049e759f40e467a126"
+content-hash = "c4d9cbf37a20c50d1d94e4ef1c8985b133cbc2817d526fd6511192c4c29e9491"
