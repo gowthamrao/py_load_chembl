@@ -2,6 +2,8 @@ import unittest
 from unittest.mock import patch, MagicMock
 from pathlib import Path
 import pytest
+import tarfile
+import gzip
 
 from py_load_chembl.adapters.postgres import PostgresAdapter
 
@@ -117,9 +119,6 @@ class TestPostgresAdapterUnit(unittest.TestCase):
 @pytest.fixture
 def postgres_adapter():
     return PostgresAdapter("postgresql://user:password@host:5432/dbname")
-
-import tarfile
-import gzip
 
 @patch("shutil.which", return_value="/usr/bin/pg_restore")
 @patch("subprocess.run")
