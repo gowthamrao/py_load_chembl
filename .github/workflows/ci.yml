@@ -35,7 +35,7 @@ jobs:
         $HOME/.local/bin/poetry run mypy .
 
     - name: Start services
-      run: docker-compose -f tests/docker-compose.yml up -d
+      run: docker compose -f tests/docker-compose.yml up -d
 
     - name: Run tests
       run: |
